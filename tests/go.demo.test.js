@@ -2,92 +2,124 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execSync } = require('node:child_process');
 
 const { createPolyClient, registerLanguage } = require('../dist');
 const { createGoAdapter } = require('../dist/adapters/go');
 
+// Function to find gopls path dynamically
+function findGoplsPath() {
+  if (process.env.GOPLS_PATH) {
+    return process.env.GOPLS_PATH;
+  }
+
+  try {
+    // Try to find gopls in PATH
+    const result = execSync('which gopls', { encoding: 'utf8' });
+    return result.trim();
+  } catch (error) {
+    // If which command fails, try common locations
+    const commonPaths = [
+      path.join(process.env.HOME || '', 'go', 'bin', 'gopls'),
+      '/usr/local/go/bin/gopls',
+      '/usr/bin/gopls',
+      '/opt/homebrew/bin/gopls'
+    ];
+
+    for (const goplsPath of commonPaths) {
+      if (fs.existsSync(goplsPath)) {
+        return goplsPath;
+      }
+    }
+
+    throw new Error('gopls not found. Please install gopls or set GOPLS_PATH environment variable.');
+  }
+}
+
 // Generate URI dynamically based on project root
 const projectRoot = path.resolve(__dirname, '..');
-const goExamplePath = path.join(projectRoot, 'examples', 'go-demo', 'main.go');
+const goWorkspaceFolder = path.join(projectRoot, 'examples', 'go-demo');
+const goExamplePath = path.join(goWorkspaceFolder, 'main.go');
 const URI = `file://${goExamplePath}`;
+const GOPLS_PATH = findGoplsPath();
 
-test('Go demo workflow validates completions, references, and formatting', async () => {
-  const goWorkspaceFolder = path.join(projectRoot, 'examples', 'go-demo');
+async function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function createGoHarness() {
   const client = createPolyClient({ workspaceFolders: [goWorkspaceFolder] });
-
-  await registerLanguage(client, createGoAdapter({ goplsPath: '/Users/qingyingliu/go/bin/gopls' }));
-
-  const source = fs.readFileSync(path.join(__dirname, '../examples/go-demo/main.go'), 'utf8');
-
+  await registerLanguage(client, createGoAdapter({ goplsPath: GOPLS_PATH }));
+  const source = fs.readFileSync(goExamplePath, 'utf8');
   client.openDocument({ uri: URI, languageId: 'go', text: source, version: 1 });
+  await delay(2000);
+  return {
+    client,
+    uri: URI,
+    dispose: () => client.dispose(),
+  };
+}
 
-  // Wait a bit for gopls to initialize and process the document
-  await new Promise(resolve => setTimeout(resolve, 2000));
+async function withGoHarness(run) {
+  const harness = await createGoHarness();
+  try {
+    await run(harness);
+  } finally {
+    harness.dispose();
+  }
+}
 
-  const completions = await client.getCompletions({
-    textDocument: { uri: URI },
-    position: { line: 5, character: 5 }
+test('Go adapter replies to completion requests', async () => {
+  await withGoHarness(async ({ client, uri }) => {
+    const completions = await client.getCompletions({
+      textDocument: { uri },
+      position: { line: 5, character: 5 },
+    });
+
+    console.log('Go completions:', completions);
+    assert.ok(completions !== undefined, 'Completions should be defined (even if null)');
   });
-
-  const definition = await client.getDefinition({
-    textDocument: { uri: URI },
-    position: { line: 4, character: 5 }
-  });
-
-  const references = await client.findReferences({
-    textDocument: { uri: URI },
-    position: { line: 4, character: 5 },
-    context: { includeDeclaration: true }
-  });
-
-  const formatEdits = await client.formatDocument({ textDocument: { uri: URI } });
-
-  const symbols = (await client.getDocumentSymbols({ textDocument: { uri: URI } })) || [];
-
-  client.dispose();
-
-  // Real gopls responses - be more lenient as gopls might return null/empty for various reasons
-  console.log('Completions:', completions);
-  console.log('Definition:', definition);
-  console.log('References:', references);
-  console.log('Format edits:', formatEdits);
-  console.log('Symbols:', symbols);
-
-  // Just verify that the adapter is responding (even if with null/empty results)
-  // This proves that the real LSP communication is working
-  assert.ok(completions !== undefined, 'Completions should be defined (even if null)');
-  assert.ok(definition !== undefined, 'Definition should be defined (even if null)');
-  assert.ok(references !== undefined, 'References should be defined (even if null)');
-  assert.ok(formatEdits !== undefined, 'Format edits should be defined (even if null)');
-  assert.ok(symbols !== undefined, 'Symbols should be defined (even if null)');
 });
 
-test('Go adapter produces references for symbols in open documents', async () => {
-  const goWorkspaceFolder = path.join(projectRoot, 'examples', 'go-demo');
-  const client = createPolyClient({ workspaceFolders: [goWorkspaceFolder] });
-  await registerLanguage(client, createGoAdapter({ goplsPath: '/Users/qingyingliu/go/bin/gopls' }));
+test('Go adapter resolves definitions from gopls', async () => {
+  await withGoHarness(async ({ client, uri }) => {
+    const definition = await client.getDefinition({
+      textDocument: { uri },
+      position: { line: 4, character: 5 },
+    });
 
-  const source = fs.readFileSync(path.join(__dirname, '../examples/go-demo/main.go'), 'utf8');
-
-  client.openDocument({ uri: URI, languageId: 'go', text: source, version: 1 });
-
-  // Wait for gopls to process
-  await new Promise(resolve => setTimeout(resolve, 2000));
-
-  const references = await client.findReferences({
-    textDocument: { uri: URI },
-    position: { line: 2, character: 9 },
-    context: { includeDeclaration: true }
+    console.log('Go definition:', definition);
+    assert.ok(definition !== undefined, 'Definition should be defined (even if null)');
   });
+});
 
-  const edits = await client.formatDocument({ textDocument: { uri: URI } });
+test('Go adapter finds references for identifiers', async () => {
+  await withGoHarness(async ({ client, uri }) => {
+    const references = await client.findReferences({
+      textDocument: { uri },
+      position: { line: 4, character: 5 },
+      context: { includeDeclaration: true },
+    });
 
-  console.log('References found:', references);
-  console.log('Format edits:', edits);
+    console.log('Go references:', references);
+    assert.ok(references !== undefined, 'References should be defined (even if null)');
+  });
+});
 
-  // Just verify that the adapter is responding
-  assert.ok(references !== undefined, 'References should be defined');
-  assert.ok(edits !== undefined, 'Format edits should be defined');
+test('Go adapter formats documents via gopls', async () => {
+  await withGoHarness(async ({ client, uri }) => {
+    const formatEdits = await client.formatDocument({ textDocument: { uri } });
 
-  client.dispose();
+    console.log('Go format edits:', formatEdits);
+    assert.ok(formatEdits !== undefined, 'Format edits should be defined (even if null)');
+  });
+});
+
+test('Go adapter returns document symbols from gopls', async () => {
+  await withGoHarness(async ({ client, uri }) => {
+    const symbols = await client.getDocumentSymbols({ textDocument: { uri } });
+
+    console.log('Go document symbols:', symbols);
+    assert.ok(symbols !== undefined, 'Symbols should be defined (even if null)');
+  });
 });
