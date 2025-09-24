@@ -180,6 +180,17 @@ export class PolyClient implements PolyClientApi {
     };
 
     this.documents.set(uri, doc);
+
+    // Notify the language adapter about the opened document
+    const record = this.languages.get(languageId);
+    if (record && record.handlers.openDocument) {
+      try {
+        record.handlers.openDocument({ uri, languageId, text: doc.text, version: doc.version });
+      } catch (error) {
+        console.error(`Error notifying ${languageId} adapter about opened document:`, error);
+      }
+    }
+
     return cloneDocument(doc)!;
   }
 
@@ -214,7 +225,22 @@ export class PolyClient implements PolyClientApi {
 
   closeDocument(uri: string): boolean {
     this.assertNotDisposed();
-    return this.documents.delete(normalizeUri(uri));
+    const normalizedUri = normalizeUri(uri);
+    const doc = this.documents.get(normalizedUri);
+
+    if (doc) {
+      // Notify the language adapter about the closed document
+      const record = this.languages.get(doc.languageId);
+      if (record && record.handlers.closeDocument) {
+        try {
+          record.handlers.closeDocument({ uri: normalizedUri });
+        } catch (error) {
+          console.error(`Error notifying ${doc.languageId} adapter about closed document:`, error);
+        }
+      }
+    }
+
+    return this.documents.delete(normalizedUri);
   }
 
   getCompletions(params: unknown): MaybePromise<unknown> {
@@ -351,6 +377,11 @@ export class PolyClient implements PolyClientApi {
 
   dispose(): void {
     if (this.disposed) return;
+
+    // Mark as disposed immediately to prevent new operations
+    this.disposed = true;
+
+    // Dispose all registered disposables
     for (const disposable of this.disposables) {
       try {
         disposable();
@@ -358,6 +389,8 @@ export class PolyClient implements PolyClientApi {
         // ignore dispose errors
       }
     }
+
+    // Shutdown all language adapters (fire-and-forget for synchronous dispose)
     for (const record of this.languages.values()) {
       if (typeof record.dispose === 'function') {
         try {
@@ -365,8 +398,20 @@ export class PolyClient implements PolyClientApi {
         } catch {
           // ignore dispose errors
         }
+      } else if (typeof record.handlers.shutdown === 'function') {
+        try {
+          record.handlers.shutdown();
+        } catch {
+          // ignore dispose errors
+        }
       }
     }
+
+    // Clean up immediately - don't wait for async operations
+    this.finalizeDispose();
+  }
+
+  private finalizeDispose(): void {
     this.languages.clear();
     this.documents.clear();
     this.diagnosticListeners.clear();

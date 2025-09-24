@@ -5,7 +5,10 @@ const path = require('node:path');
 
 const { createPolyClient, registerLanguage } = require('../dist');
 
-const URI = 'file:///Users/qingyingliu/Code/PolyLSP/examples/ts-demo/src/index.ts';
+// Generate URI dynamically based on project root
+const projectRoot = path.resolve(__dirname, '..');
+const tsExamplePath = path.join(projectRoot, 'examples', 'ts-demo', 'src', 'index.ts');
+const URI = `file://${tsExamplePath}`;
 
 // Simple test adapter that doesn't require external tools
 function createTestTypeScriptAdapter() {
@@ -48,7 +51,8 @@ function createTestTypeScriptAdapter() {
 }
 
 test('TypeScript demo workflow exercises key APIs', async () => {
-  const client = createPolyClient({ workspaceFolders: ['/Users/qingyingliu/Code/PolyLSP/examples/ts-demo'] });
+  const tsWorkspaceFolder = path.join(projectRoot, 'examples', 'ts-demo');
+  const client = createPolyClient({ workspaceFolders: [tsWorkspaceFolder] });
   const workspaceEvents = [];
   const diagnostics = [];
 
@@ -99,7 +103,8 @@ test('TypeScript demo workflow exercises key APIs', async () => {
 });
 
 test('TypeScript adapter emits symbols and rename edits based on document text', async () => {
-  const client = createPolyClient({ workspaceFolders: ['/Users/qingyingliu/Code/PolyLSP/examples/ts-demo'] });
+  const tsWorkspaceFolder = path.join(projectRoot, 'examples', 'ts-demo');
+  const client = createPolyClient({ workspaceFolders: [tsWorkspaceFolder] });
   registerLanguage(client, createTestTypeScriptAdapter());
 
   const source = fs.readFileSync(path.join(__dirname, '../examples/ts-demo/src/index.ts'), 'utf8');

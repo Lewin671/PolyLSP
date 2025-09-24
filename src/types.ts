@@ -87,6 +87,10 @@ export type LanguageRegistrationContext = {
 };
 
 export type LanguageHandlers = {
+  initialize?: (context: LanguageRegistrationContext) => MaybePromise<unknown>;
+  shutdown?: () => MaybePromise<void>;
+  openDocument?: (params: { uri: string; languageId: string; text: string; version: number }) => MaybePromise<void>;
+  closeDocument?: (params: { uri: string }) => MaybePromise<void>;
   getCompletions?: (params: unknown, context: RequestContext) => MaybePromise<unknown>;
   getHover?: (params: unknown, context: RequestContext) => MaybePromise<unknown>;
   getDefinition?: (params: unknown, context: RequestContext) => MaybePromise<unknown>;
