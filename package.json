@@ -1,0 +1,19 @@
+{
+  "name": "polylsp",
+  "version": "0.1.0",
+  "description": "A lightweight multi-language LSP client abstraction.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "types": "types/index.d.ts",
+  "files": [
+    "src",
+    "types"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
