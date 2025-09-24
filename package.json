@@ -4,16 +4,19 @@
   "description": "A lightweight multi-language LSP client abstraction.",
   "license": "MIT",
   "type": "commonjs",
-  "main": "src/index.js",
-  "types": "types/index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "files": [
-    "src",
-    "types"
+    "dist"
   ],
   "scripts": {
-    "test": "node --test tests/*.test.js"
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/*.test.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
   }
 }

@@ -45,12 +45,26 @@ export type WorkspaceEvent<T = unknown> = {
 
 export type Listener<T> = (event: T) => void;
 
-export type Disposable = {
+export interface Disposable {
   readonly closed: boolean;
   unsubscribe(): void;
-};
+}
 
 export type MaybePromise<T> = T | Promise<T>;
+
+export type TextDocument = {
+  uri: string;
+  languageId: string;
+  text: string;
+  version: number;
+  openedAt: Date;
+};
+
+export type PolyClientOptions = {
+  transport?: string;
+  workspaceFolders?: string[];
+  metadata?: Record<string, unknown>;
+};
 
 export type RequestContext = {
   languageId: string;
@@ -58,6 +72,8 @@ export type RequestContext = {
   workspaceFolders: string[];
   getDocument(uri: string): TextDocument | null;
 };
+
+export type NotifyClient = (method: string, payload: unknown) => void;
 
 export type LanguageRegistrationContext = {
   languageId: string;
@@ -67,7 +83,7 @@ export type LanguageRegistrationContext = {
   getDocument(uri: string): TextDocument | null;
   listDocuments(): TextDocument[];
   getRegisteredLanguages(): string[];
-  notifyClient(method: string, payload: unknown): void;
+  notifyClient: NotifyClient;
 };
 
 export type LanguageHandlers = {
@@ -94,20 +110,6 @@ export type LanguageAdapter = {
   dispose?: () => void | Promise<void>;
   handlers?: LanguageHandlers;
   [key: string]: unknown;
-};
-
-export type PolyClientOptions = {
-  transport?: string;
-  workspaceFolders?: string[];
-  metadata?: Record<string, unknown>;
-};
-
-export type TextDocument = {
-  uri: string;
-  languageId: string;
-  text: string;
-  version: number;
-  openedAt: Date;
 };
 
 export type RegisteredLanguage = {
@@ -147,14 +149,3 @@ export interface PolyClient {
   applyWorkspaceEdit(edit: WorkspaceEdit): { applied: boolean; failures: { uri: string; reason: string }[] };
   dispose(): void;
 }
-
-export declare class PolyClientError extends Error {
-  constructor(code: string, message: string);
-  readonly code: string;
-}
-
-export function createPolyClient(options?: PolyClientOptions): PolyClient;
-
-export function registerLanguage(client: PolyClient, adapter: LanguageAdapter): MaybePromise<string>;
-
-export function unregisterLanguage(client: PolyClient, languageId: string): boolean;

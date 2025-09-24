@@ -6,7 +6,7 @@ const {
   registerLanguage,
   unregisterLanguage,
   PolyClientError,
-} = require('../src');
+} = require('../dist');
 
 const URI = 'file:///project/example.ts';
 

@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { runGoDemo, createGoDemoAdapter } = require('../examples/go-demo');
-const { createPolyClient, registerLanguage } = require('../src');
+const { createPolyClient, registerLanguage } = require('../dist');
 
 const URI = 'file:///go-demo.go';
 
