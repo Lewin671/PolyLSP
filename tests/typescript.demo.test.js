@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { createPolyClient, registerLanguage } = require('../dist');
+const { createTypeScriptAdapter } = require('../dist/adapters/typescript');
 
 // Generate URI dynamically based on project root
 const projectRoot = path.resolve(__dirname, '..');
@@ -11,49 +12,13 @@ const tsWorkspaceFolder = path.join(projectRoot, 'examples', 'ts-demo');
 const tsExamplePath = path.join(tsWorkspaceFolder, 'src', 'index.ts');
 const URI = `file://${tsExamplePath}`;
 
-// Simple test adapter that doesn't require external tools
-function createTestTypeScriptAdapter() {
-  return {
-    languageId: 'typescript',
-    handlers: {
-      initialize: () => {
-        // Adapter has no async setup
-      },
-      getCompletions: (params) => ({
-        isIncomplete: false,
-        items: [{ label: 'runDemo', kind: 3 }, { label: 'main', kind: 3 }],
-      }),
-      getHover: (params) => ({
-        contents: ['runDemo: (name: string) => string'],
-      }),
-      getDefinition: (params) => ({
-        uri: params.textDocument.uri,
-        range: { start: { line: 0, character: 16 }, end: { line: 0, character: 23 } },
-      }),
-      findReferences: (params) => [
-        { uri: params.textDocument.uri, range: { start: { line: 0, character: 16 }, end: { line: 0, character: 23 } } },
-        { uri: params.textDocument.uri, range: { start: { line: 5, character: 20 }, end: { line: 5, character: 27 } } },
-      ],
-      formatDocument: () => [],
-      getDocumentSymbols: () => [
-        { name: 'runDemo', kind: 12, range: { start: { line: 0, character: 0 }, end: { line: 2, character: 1 } } },
-        { name: 'main', kind: 12, range: { start: { line: 4, character: 0 }, end: { line: 9, character: 1 } } },
-      ],
-      renameSymbol: (params) => ({
-        changes: {
-          [params.textDocument.uri]: [
-            { range: { start: { line: 0, character: 16 }, end: { line: 0, character: 23 } }, newText: params.newName },
-            { range: { start: { line: 5, character: 20 }, end: { line: 5, character: 27 } }, newText: params.newName },
-          ],
-        },
-      }),
-    },
-  };
-}
+// Path to tsserver.js in node_modules
+const tsserverPath = path.join(projectRoot, 'node_modules', 'typescript', 'lib', 'tsserver.js');
 
 function createTypeScriptHarness() {
   const client = createPolyClient({ workspaceFolders: [tsWorkspaceFolder] });
-  registerLanguage(client, createTestTypeScriptAdapter());
+  const adapter = createTypeScriptAdapter({ tsserverPath });
+  registerLanguage(client, adapter);
   const source = fs.readFileSync(tsExamplePath, 'utf8');
   client.openDocument({ uri: URI, languageId: 'typescript', text: source, version: 1 });
   return {
