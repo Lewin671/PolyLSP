@@ -3,6 +3,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
+// Use the bundled fake server to keep tests self-contained without the real package.
+process.env.POLY_TYPESCRIPT_LANGUAGE_SERVER_PATH = path.join(
+  __dirname,
+  'fixtures',
+  'fake-typescript-language-server.js'
+);
+
 const { createPolyClient, registerLanguage } = require('../dist');
 const { createTypeScriptAdapter } = require('../dist/adapters/typescript');
 
@@ -12,12 +19,9 @@ const tsWorkspaceFolder = path.join(projectRoot, 'examples', 'ts-demo');
 const tsExamplePath = path.join(tsWorkspaceFolder, 'src', 'index.ts');
 const URI = `file://${tsExamplePath}`;
 
-// Path to tsserver.js in node_modules
-const tsserverPath = path.join(projectRoot, 'node_modules', 'typescript', 'lib', 'tsserver.js');
-
 function createTypeScriptHarness() {
   const client = createPolyClient({ workspaceFolders: [tsWorkspaceFolder] });
-  const adapter = createTypeScriptAdapter({ tsserverPath });
+  const adapter = createTypeScriptAdapter();
   registerLanguage(client, adapter);
   const source = fs.readFileSync(tsExamplePath, 'utf8');
   client.openDocument({ uri: URI, languageId: 'typescript', text: source, version: 1 });

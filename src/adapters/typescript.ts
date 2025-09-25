@@ -1,232 +1,317 @@
 import { ChildProcess, spawn } from 'child_process';
-import { createInterface } from 'readline';
+import path from 'node:path';
 import { LanguageAdapter, LanguageRegistrationContext } from '../types';
 
-export function createTypeScriptAdapter(options: { tsserverPath: string }): LanguageAdapter {
-    const tsserverPath = options.tsserverPath;
+type PendingRequest = {
+  resolve: (value: unknown) => void;
+  reject: (error?: unknown) => void;
+};
 
-    let process: ChildProcess | null = null;
-    let seq = 0;
-    const pendingRequests = new Map<number, (result: any) => void>();
-    let initialized = false;
+function resolveServerEntry(): string {
+  const override = typeof process !== 'undefined' ? process.env?.POLY_TYPESCRIPT_LANGUAGE_SERVER_PATH : undefined;
+  if (override && override.trim().length > 0) {
+    const cwd = typeof process !== 'undefined' && typeof process.cwd === 'function' ? process.cwd() : '';
+    return path.isAbsolute(override) ? override : path.resolve(cwd || '.', override);
+  }
+  try {
+    return require.resolve('typescript-language-server/lib/cli.js');
+  } catch (error) {
+    throw new Error(
+      'Unable to resolve typescript-language-server. Please install "typescript-language-server" as a dependency.'
+    );
+  }
+}
 
-    const startServer = () => {
-        process = spawn('node', [tsserverPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+export function createTypeScriptAdapter(): LanguageAdapter {
+  const serverEntry = resolveServerEntry();
 
-        let buffer = '';
-        process.stdout!.on('data', (chunk: Buffer) => {
-            buffer += chunk.toString();
+  let serverProcess: ChildProcess | null = null;
+  let buffer = '';
+  let requestId = 0;
+  let initialized = false;
+  let registrationContext: LanguageRegistrationContext | null = null;
+  let initializationResult: unknown = null;
+  let initPromise: Promise<unknown> | null = null;
+  const pendingRequests = new Map<number, PendingRequest>();
+  const pendingNotifications: { method: string; params: unknown }[] = [];
 
-            while (true) {
-                const contentLengthMatch = buffer.match(/^Content-Length: (\d+)\r?\n\r?\n/);
-                if (!contentLengthMatch) break;
+  const handleMessage = (message: any) => {
+    if (message.id !== undefined && pendingRequests.has(message.id)) {
+      const pending = pendingRequests.get(message.id)!;
+      pendingRequests.delete(message.id);
+      if (message.error) {
+        pending.reject(message.error);
+      } else {
+        pending.resolve(message.result ?? null);
+      }
+      return;
+    }
 
-                const contentLength = parseInt(contentLengthMatch[1], 10);
-                const headerLength = contentLengthMatch[0].length;
+    if (message.method === 'textDocument/publishDiagnostics' && registrationContext) {
+      const params = message.params ?? {};
+      const diagnostics = Array.isArray(params.diagnostics) ? params.diagnostics : [];
+      registrationContext.publishDiagnostics(params.uri, diagnostics);
+      return;
+    }
 
-                if (buffer.length < headerLength + contentLength) break;
+    if (message.method && registrationContext) {
+      registrationContext.notifyClient(message.method, message.params ?? {});
+    }
+  };
 
-                const messageContent = buffer.substring(headerLength, headerLength + contentLength);
-                buffer = buffer.substring(headerLength + contentLength);
+  const startServer = () => {
+    serverProcess = spawn(process.execPath, [serverEntry, '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    buffer = '';
 
-                try {
-                    const msg = JSON.parse(messageContent);
-                    if (msg.request_seq !== undefined && pendingRequests.has(msg.request_seq)) {
-                        pendingRequests.get(msg.request_seq)!(msg);
-                        pendingRequests.delete(msg.request_seq);
-                    } else if (msg.event) {
-                        // Handle events/notifications
-                    }
-                } catch (e) {
-                    console.error('Error parsing tsserver message:', e);
-                }
-            }
+    serverProcess.stdout?.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString();
+      while (true) {
+        const headerEnd = buffer.indexOf('\r\n\r\n');
+        if (headerEnd === -1) break;
+
+        const header = buffer.slice(0, headerEnd);
+        const lengthMatch = header.match(/Content-Length: (\d+)/i);
+        if (!lengthMatch) {
+          buffer = buffer.slice(headerEnd + 4);
+          continue;
+        }
+
+        const contentLength = parseInt(lengthMatch[1], 10);
+        const totalLength = headerEnd + 4 + contentLength;
+        if (buffer.length < totalLength) {
+          break;
+        }
+
+        const payload = buffer.slice(headerEnd + 4, totalLength);
+        buffer = buffer.slice(totalLength);
+
+        try {
+          const message = JSON.parse(payload);
+          handleMessage(message);
+        } catch (error) {
+          console.error('Failed to parse LSP message from typescript-language-server:', error);
+        }
+      }
+    });
+
+    serverProcess.stderr?.on('data', (chunk: Buffer) => {
+      console.error('[typescript-language-server]', chunk.toString());
+    });
+
+    serverProcess.on('error', (error) => {
+      console.error('Failed to start typescript-language-server process:', error);
+    });
+
+    serverProcess.on('close', () => {
+      serverProcess = null;
+      for (const [, pending] of pendingRequests) {
+        pending.reject(new Error('typescript-language-server exited'));
+      }
+      pendingRequests.clear();
+      initialized = false;
+      initPromise = null;
+      initializationResult = null;
+    });
+  };
+
+  const ensureServer = () => {
+    if (!serverProcess) {
+      startServer();
+    }
+  };
+
+  const writeMessage = (payload: string) => {
+    if (!serverProcess || !serverProcess.stdin || serverProcess.stdin.destroyed) {
+      throw new Error('typescript-language-server process is not available.');
+    }
+    serverProcess.stdin.write(payload);
+  };
+
+  const sendRawRequest = (method: string, params: unknown): Promise<unknown> => {
+    ensureServer();
+    const id = ++requestId;
+    const message = JSON.stringify({ jsonrpc: '2.0', id, method, params });
+    const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
+
+    return new Promise((resolve, reject) => {
+      pendingRequests.set(id, { resolve, reject });
+      try {
+        writeMessage(content);
+      } catch (error) {
+        pendingRequests.delete(id);
+        reject(error);
+        return;
+      }
+
+      setTimeout(() => {
+        if (pendingRequests.has(id)) {
+          pendingRequests.delete(id);
+          reject(new Error(`typescript-language-server request "${method}" timed out.`));
+        }
+      }, 15000);
+    });
+  };
+
+  const flushPendingNotifications = () => {
+    if (!initialized || !serverProcess || !serverProcess.stdin || serverProcess.stdin.destroyed) {
+      return;
+    }
+    while (pendingNotifications.length > 0) {
+      const { method, params } = pendingNotifications.shift()!;
+      const message = JSON.stringify({ jsonrpc: '2.0', method, params });
+      const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
+      writeMessage(content);
+    }
+  };
+
+  const sendNotification = (method: string, params: unknown) => {
+    if (!initialized) {
+      pendingNotifications.push({ method, params });
+      ensureServer();
+      if (!initPromise) {
+        ensureInitialized();
+      }
+      return;
+    }
+
+    const message = JSON.stringify({ jsonrpc: '2.0', method, params });
+    const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
+    try {
+      writeMessage(content);
+    } catch (error) {
+      console.error('Failed to send notification to typescript-language-server:', error);
+    }
+  };
+
+  const ensureInitialized = (ctx?: LanguageRegistrationContext | null): Promise<unknown> => {
+    if (initialized) {
+      return Promise.resolve(initializationResult);
+    }
+
+    if (!initPromise) {
+      initPromise = (async () => {
+        const context = ctx ?? registrationContext;
+        ensureServer();
+        const workspaceFolder = context?.options.workspaceFolders?.[0];
+        const rootUri = workspaceFolder ? `file://${workspaceFolder}` : null;
+        const result = await sendRawRequest('initialize', {
+          processId: process.pid ?? null,
+          rootUri,
+          capabilities: {
+            textDocument: {
+              synchronization: { dynamicRegistration: false },
+              completion: { dynamicRegistration: false },
+              hover: { dynamicRegistration: false },
+              definition: { dynamicRegistration: false },
+              references: { dynamicRegistration: false },
+              documentSymbol: { dynamicRegistration: false },
+              rename: { dynamicRegistration: false },
+              formatting: { dynamicRegistration: false },
+            },
+            workspace: { workspaceFolders: true },
+          },
+          initializationOptions: {
+            preferences: {},
+          },
+          workspaceFolders: workspaceFolder ? [{ uri: rootUri, name: 'workspace' }] : [],
         });
 
-        process.on('close', (code: number | null) => {
-            console.log(`tsserver exited with code ${code}`);
-            process = null;
-        });
-    };
+        const message = JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} });
+        const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
+        writeMessage(content);
 
-    const sendCommand = async (command: string, args: any): Promise<any> => {
-        if (!process) startServer();
-        const request = { seq: ++seq, type: 'request', command, arguments: args };
-        const message = JSON.stringify(request);
-        process!.stdin!.write(message + '\n');
-        return new Promise((resolve) => {
-            pendingRequests.set(request.seq, resolve);
-        });
-    };
+        initialized = true;
+        initializationResult = result;
+        flushPendingNotifications();
+        return result;
+      })().catch((error) => {
+        initPromise = null;
+        throw error;
+      });
+    }
 
-    const handlers = {
-        initialize: async (ctx: LanguageRegistrationContext) => {
-            await sendCommand('configure', {
-                hostInfo: 'polylsp',
-                preferences: {}, // Add prefs
-            });
-            initialized = true;
+    return initPromise;
+  };
+
+  const sendRequest = async (method: string, params: unknown): Promise<unknown> => {
+    await ensureInitialized();
+    return sendRawRequest(method, params);
+  };
+
+  const handlers = {
+    shutdown: async () => {
+      if (!serverProcess) return;
+      if (initialized) {
+        try {
+          await Promise.race([
+            sendRequest('shutdown', {}),
+            new Promise((resolve) => setTimeout(resolve, 2000)),
+          ]);
+          sendNotification('exit', {});
+        } catch (error) {
+          console.error('Error shutting down typescript-language-server:', error);
+        }
+      }
+
+      for (const [, pending] of pendingRequests) {
+        pending.reject(new Error('typescript-language-server shutdown'));
+      }
+      pendingRequests.clear();
+
+      if (serverProcess) {
+        serverProcess.kill('SIGTERM');
+        serverProcess = null;
+      }
+      initialized = false;
+      registrationContext = null;
+    },
+
+    openDocument: (params: { uri: string; languageId: string; text: string; version: number }) => {
+      ensureInitialized().catch(() => undefined);
+      sendNotification('textDocument/didOpen', {
+        textDocument: {
+          uri: params.uri,
+          languageId: params.languageId,
+          version: params.version,
+          text: params.text,
         },
+      });
+    },
 
-        shutdown: async () => {
-            if (initialized) {
-                await sendCommand('exit', {});
-            }
-            if (process) process.kill();
-        },
+    closeDocument: (params: { uri: string }) => {
+      ensureInitialized().catch(() => undefined);
+      sendNotification('textDocument/didClose', {
+        textDocument: { uri: params.uri },
+      });
+    },
 
-        getCompletions: async (params: any) => {
-            // First, open the file
-            await sendCommand('open', { file: params.textDocument.uri.replace('file://', '') });
+    getCompletions: (params: unknown) => sendRequest('textDocument/completion', params),
+    getHover: (params: unknown) => sendRequest('textDocument/hover', params),
+    getDefinition: (params: unknown) => sendRequest('textDocument/definition', params),
+    findReferences: (params: unknown) => sendRequest('textDocument/references', params),
+    getDocumentSymbols: (params: unknown) => sendRequest('textDocument/documentSymbol', params),
+    renameSymbol: (params: unknown) => sendRequest('textDocument/rename', params),
+    formatDocument: (params: unknown) => sendRequest('textDocument/formatting', params),
+  };
 
-            const result = await sendCommand('completionInfo', {
-                file: params.textDocument.uri.replace('file://', ''),
-                line: params.position.line + 1, // tsserver uses 1-based lines
-                offset: params.position.character + 1 // tsserver uses 1-based characters
-            });
-
-            return {
-                isIncomplete: false,
-                items: result.body?.entries?.map((entry: any) => ({
-                    label: entry.name,
-                    kind: entry.kind === 'function' ? 3 : 6, // Function or Variable
-                    detail: entry.kind
-                })) || []
-            };
-        },
-
-        getHover: async (params: any) => {
-            await sendCommand('open', { file: params.textDocument.uri.replace('file://', '') });
-
-            const result = await sendCommand('quickinfo', {
-                file: params.textDocument.uri.replace('file://', ''),
-                line: params.position.line + 1,
-                offset: params.position.character + 1
-            });
-
-            return {
-                contents: result.body?.displayString ? [result.body.displayString] : []
-            };
-        },
-
-        getDefinition: async (params: any) => {
-            await sendCommand('open', { file: params.textDocument.uri.replace('file://', '') });
-
-            const result = await sendCommand('definition', {
-                file: params.textDocument.uri.replace('file://', ''),
-                line: params.position.line + 1,
-                offset: params.position.character + 1
-            });
-
-            if (result.body?.[0]) {
-                const def = result.body[0];
-                return {
-                    uri: `file://${def.file}`,
-                    range: {
-                        start: { line: def.start.line - 1, character: def.start.offset - 1 },
-                        end: { line: def.end.line - 1, character: def.end.offset - 1 }
-                    }
-                };
-            }
-            return null;
-        },
-
-        findReferences: async (params: any) => {
-            await sendCommand('open', { file: params.textDocument.uri.replace('file://', '') });
-
-            const result = await sendCommand('references', {
-                file: params.textDocument.uri.replace('file://', ''),
-                line: params.position.line + 1,
-                offset: params.position.character + 1
-            });
-
-            return result.body?.refs?.map((ref: any) => ({
-                uri: `file://${ref.file}`,
-                range: {
-                    start: { line: ref.start.line - 1, character: ref.start.offset - 1 },
-                    end: { line: ref.end.line - 1, character: ref.end.offset - 1 }
-                }
-            })) || [];
-        },
-
-        getDocumentSymbols: async (params: any) => {
-            await sendCommand('open', { file: params.textDocument.uri.replace('file://', '') });
-
-            const result = await sendCommand('navtree', {
-                file: params.textDocument.uri.replace('file://', '')
-            });
-
-            const extractSymbols = (item: any): any[] => {
-                const symbols = [];
-                if (item.text && item.text !== '<global>') {
-                    symbols.push({
-                        name: item.text,
-                        kind: item.kind === 'function' ? 12 : 13, // Function or Variable
-                        range: item.spans?.[0] ? {
-                            start: { line: item.spans[0].start.line - 1, character: item.spans[0].start.offset - 1 },
-                            end: { line: item.spans[0].end.line - 1, character: item.spans[0].end.offset - 1 }
-                        } : { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }
-                    });
-                }
-                if (item.childItems) {
-                    item.childItems.forEach((child: any) => {
-                        symbols.push(...extractSymbols(child));
-                    });
-                }
-                return symbols;
-            };
-
-            return result.body ? extractSymbols(result.body) : [];
-        },
-
-        renameSymbol: async (params: any) => {
-            await sendCommand('open', { file: params.textDocument.uri.replace('file://', '') });
-
-            const result = await sendCommand('rename', {
-                file: params.textDocument.uri.replace('file://', ''),
-                line: params.position.line + 1,
-                offset: params.position.character + 1
-            });
-
-            const changes: any = {};
-            if (result.body?.locs) {
-                result.body.locs.forEach((loc: any) => {
-                    const uri = `file://${loc.file}`;
-                    if (!changes[uri]) changes[uri] = [];
-                    loc.locs.forEach((span: any) => {
-                        changes[uri].push({
-                            range: {
-                                start: { line: span.start.line - 1, character: span.start.offset - 1 },
-                                end: { line: span.end.line - 1, character: span.end.offset - 1 }
-                            },
-                            newText: params.newName
-                        });
-                    });
-                });
-            }
-
-            return { changes };
-        },
-
-        formatDocument: async (params: any) => {
-            await sendCommand('open', { file: params.textDocument.uri.replace('file://', '') });
-
-            const result = await sendCommand('format', {
-                file: params.textDocument.uri.replace('file://', ''),
-                line: 1,
-                offset: 1,
-                endLine: 1000000, // Large number to format entire document
-                endOffset: 1
-            });
-
-            return result.body || [];
-        },
-
-        // tsserver uses different commands, so map LSP to tsserver as needed
-    };
-
-    return {
-        languageId: 'typescript',
-        handlers,
-    };
+  return {
+    languageId: 'typescript',
+    initialize: async (ctx: LanguageRegistrationContext) => {
+      registrationContext = ctx;
+      return ensureInitialized(ctx);
+    },
+    handlers,
+    dispose: () => {
+      if (serverProcess) {
+        serverProcess.kill('SIGTERM');
+        serverProcess = null;
+      }
+      pendingRequests.clear();
+      registrationContext = null;
+      initializationResult = null;
+      initPromise = null;
+      pendingNotifications.length = 0;
+      buffer = '';
+    },
+  };
 }
