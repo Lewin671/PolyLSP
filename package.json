@@ -21,6 +21,6 @@
   },
   "dependencies": {
     "@types/node": "^24.5.2",
-    "typescript-language-server": "^5.3.3"
+    "typescript-language-server": "^5.0.0"
   }
 }
