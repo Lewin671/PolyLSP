@@ -41,13 +41,25 @@ const projectRoot = path.resolve(__dirname, '..');
 const goWorkspaceFolder = path.join(projectRoot, 'examples', 'go-demo');
 const goExamplePath = path.join(goWorkspaceFolder, 'main.go');
 const URI = `file://${goExamplePath}`;
-const GOPLS_PATH = findGoplsPath();
+let GOPLS_PATH = null;
+let skipGoTests = false;
+
+try {
+  GOPLS_PATH = findGoplsPath();
+} catch (error) {
+  skipGoTests = true;
+  console.warn('Skipping Go adapter tests:', error.message);
+}
 
 async function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function createGoHarness() {
+  if (!GOPLS_PATH) {
+    throw new Error('gopls path not resolved');
+  }
+
   const client = createPolyClient({ workspaceFolders: [goWorkspaceFolder] });
   await registerLanguage(client, createGoAdapter({ goplsPath: GOPLS_PATH }));
   const source = fs.readFileSync(goExamplePath, 'utf8');
@@ -69,7 +81,9 @@ async function withGoHarness(run) {
   }
 }
 
-test('Go adapter replies to completion requests', async () => {
+const goTest = skipGoTests ? test.skip : test;
+
+goTest('Go adapter replies to completion requests', async () => {
   await withGoHarness(async ({ client, uri }) => {
     const completions = await client.getCompletions({
       textDocument: { uri },
@@ -81,7 +95,7 @@ test('Go adapter replies to completion requests', async () => {
   });
 });
 
-test('Go adapter resolves definitions from gopls', async () => {
+goTest('Go adapter resolves definitions from gopls', async () => {
   await withGoHarness(async ({ client, uri }) => {
     const definition = await client.getDefinition({
       textDocument: { uri },
@@ -93,7 +107,7 @@ test('Go adapter resolves definitions from gopls', async () => {
   });
 });
 
-test('Go adapter finds references for identifiers', async () => {
+goTest('Go adapter finds references for identifiers', async () => {
   await withGoHarness(async ({ client, uri }) => {
     const references = await client.findReferences({
       textDocument: { uri },
@@ -106,7 +120,7 @@ test('Go adapter finds references for identifiers', async () => {
   });
 });
 
-test('Go adapter formats documents via gopls', async () => {
+goTest('Go adapter formats documents via gopls', async () => {
   await withGoHarness(async ({ client, uri }) => {
     const formatEdits = await client.formatDocument({ textDocument: { uri } });
 
@@ -115,7 +129,7 @@ test('Go adapter formats documents via gopls', async () => {
   });
 });
 
-test('Go adapter returns document symbols from gopls', async () => {
+goTest('Go adapter returns document symbols from gopls', async () => {
   await withGoHarness(async ({ client, uri }) => {
     const symbols = await client.getDocumentSymbols({ textDocument: { uri } });
 

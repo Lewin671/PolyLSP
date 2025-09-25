@@ -53,7 +53,7 @@ yarn add polylsp
 ### 基本用法
 ```ts
 import { createPolyClient, registerLanguage } from "polylsp";
-import { typescriptAdapter } from "polylsp/adapters/typescript";
+import { createTypeScriptAdapter } from "polylsp/adapters/typescript";
 import { pythonAdapter } from "polylsp/adapters/python";
 
 const client = await createPolyClient({
@@ -61,9 +61,10 @@ const client = await createPolyClient({
   workspaceFolders: ["./src"],
 });
 
-registerLanguage(client, typescriptAdapter({
-  tsserverPath: "node_modules/typescript/lib/tsserver.js",
-}));
+registerLanguage(client, createTypeScriptAdapter());
+
+// TypeScript 适配器会自动调用 `typescript-language-server --stdio`
+//（需将 `typescript-language-server` 安装为依赖），无需额外的路径配置。
 
 registerLanguage(client, pythonAdapter({
   command: "pyright-langserver",
@@ -126,7 +127,7 @@ console.log(completions.items.map(item => item.label));
 ## 开发计划
 - [ ] 搭建基础 monorepo 结构与打包流程（可选 pnpm/workspaces）。
 - [ ] 实现核心 LSP 连接与请求调度逻辑。
-- [ ] 提供 TypeScript 语言适配器示例（基于 tsserver）。
+- [ ] 提供 TypeScript 语言适配器示例（基于 typescript-language-server）。
 - [ ] 引入诊断、补全、跳转等高优先级特性。
 - [ ] 编写自动化测试（协议兼容性、事件流、集成测试）。
 - [ ] 编写文档网站与 API 参考。

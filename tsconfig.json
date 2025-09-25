@@ -10,10 +10,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "useUnknownInCatchVariables": false,
-    "types": [
-      "node"
-    ]
+    "useUnknownInCatchVariables": false
   },
   "include": [
     "src/**/*"
