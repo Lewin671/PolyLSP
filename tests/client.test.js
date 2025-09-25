@@ -193,6 +193,7 @@ test('applyWorkspaceEdit mutates open documents and synchronizes with adapters',
   });
 
   assert.equal(result.applied, true);
+  assert.equal(result.failureReason, undefined);
   assert.equal(updatePayloads.length, 1);
   assert.equal(updatePayloads[0].version, 2);
   assert.equal(updatePayloads[0].text.includes('return 2'), true);
@@ -203,6 +204,120 @@ test('applyWorkspaceEdit mutates open documents and synchronizes with adapters',
     changes: [{ text: 'function add() {\n  return 2;\n}\n' }],
   });
   assert.equal(updated.text.includes('return 2'), true);
+  await client.dispose();
+});
+
+test('applyWorkspaceEdit supports documentChanges with text edits', async () => {
+  const client = createPolyClient();
+  const updates = [];
+  const adapter = createMockAdapter({
+    handlers: {
+      updateDocument: (payload) => updates.push(payload),
+    },
+  });
+  await registerLanguage(client, adapter);
+  client.openDocument({
+    uri: URI,
+    languageId: 'mock',
+    text: 'package main\n\nfunc add(a int, b int) int {\n  return a + b\n}\n',
+    version: 1,
+  });
+
+  const edit = {
+    documentChanges: [
+      {
+        textDocument: { uri: URI, version: 1 },
+        edits: [
+          {
+            range: {
+              start: { line: 3, character: 10 },
+              end: { line: 3, character: 11 },
+            },
+            newText: 'b',
+          },
+        ],
+      },
+    ],
+  };
+
+  const result = client.applyWorkspaceEdit(edit);
+  assert.equal(result.applied, true);
+  assert.equal(result.failures.length, 0);
+  assert.equal(updates.length > 0, true);
+  assert.equal(updates[0].changes[0].text, 'b');
+
+  await client.dispose();
+});
+
+test('applyWorkspaceEdit reports failure metadata', async () => {
+  const client = createPolyClient();
+  const adapter = createMockAdapter();
+  await registerLanguage(client, adapter);
+  client.openDocument({ uri: URI, languageId: 'mock', text: 'const x = 1;', version: 1 });
+
+  const result = client.applyWorkspaceEdit({
+    documentChanges: [
+      {
+        textDocument: { uri: 'file:///missing.ts', version: 1 },
+        edits: [
+          {
+            range: {
+              start: { line: 0, character: 0 },
+              end: { line: 0, character: 0 },
+            },
+            newText: 'test',
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(result.applied, false);
+  assert.equal(result.failures.length, 1);
+  assert.notEqual(result.failureReason, undefined);
+  assert.equal(typeof result.failedChange, 'number');
+
+  await client.dispose();
+});
+
+test('LanguageRegistrationContext handles server requests via PolyClient', async () => {
+  const client = createPolyClient();
+  let handleServerRequest;
+  await registerLanguage(client, {
+    languageId: 'server',
+    async initialize(context) {
+      handleServerRequest = context.handleServerRequest;
+    },
+  });
+
+  assert.equal(typeof handleServerRequest, 'function');
+
+  client.openDocument({ uri: URI, languageId: 'server', text: 'let value = 1;', version: 1 });
+
+  const applyResponse = await handleServerRequest('workspace/applyEdit', {
+    edit: {
+      changes: {
+        [URI]: [
+          {
+            range: {
+              start: { line: 0, character: 11 },
+              end: { line: 0, character: 12 },
+            },
+            newText: '2',
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(applyResponse.applied, true);
+
+  const configResponse = await handleServerRequest('workspace/configuration', {
+    items: [{ section: 'test' }],
+  });
+  assert.equal(Array.isArray(configResponse), true);
+  assert.equal(configResponse.length, 1);
+
   await client.dispose();
 });
 

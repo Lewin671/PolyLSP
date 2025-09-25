@@ -47,10 +47,11 @@ PolyLSP 是一个面向多语言的 LSP（Language Server Protocol）客户端�
 
 ## 传输层与适配器复用
 
-- 新增 `JsonRpcConnection` 工具类封装了 Content-Length 帧解析、请求/响应匹配、超时控制与错误传播逻辑，TypeScript 与 Go 适配器均复用该组件，消除了过去重复实现的缓冲区拼接与队列管理代码。
+- 新增 `JsonRpcConnection` 工具类封装了 Content-Length 帧解析、请求/响应匹配、超时控制与错误传播逻辑，TypeScript 与 Go 适配器均复用该组件，消除了过去重复实现的缓冲区拼接与队列管理代码；同时支持语言服务器主动发起的 JSON-RPC 请求，并将 `error` 响应转化为异常向上传递，避免协议失败被静默忽略。
 - 适配器在初始化阶段会自动排队文档同步与通知请求；当语言服务器准备就绪后，PolyClient 会按顺序冲洗队列，避免初始化过程中丢失 `didOpen`/`didChange`。
 - 初始化失败会触发 `onError` 事件，并保证执行 `shutdown`/`dispose` 清理流程，防止残留子进程或事件监听。
-- `applyWorkspaceEdit` 现会将增量 `TextEdit` 转换为对应的 `DocumentChange`，确保语言服务器与本地文本版本保持一致；`updateDocument` 允许空变更用于仅更新版本号的场景。
+- 文本同步策略会根据语言服务器在 `initialize` 结果中声明的 `textDocumentSync` 能力进行调整：自动在 `Full`/`Incremental` 模式间切换，并在关闭 `openClose` 能力时跳过对应通知。
+- `applyWorkspaceEdit` 支持 LSP 3.17 的 `documentChanges`、重命名等结构，并在失败时回传符合规范的 `failureReason`/`failedChange` 字段，方便与 `workspace/applyEdit` 请求协作；`updateDocument` 允许空变更用于仅更新版本号的场景。
 
 ## 快速开始
 > 当前仓库处于初始化阶段，以下示例展示了规划中的使用方式，便于对整体 API 有直观认识。

@@ -2,6 +2,7 @@ import { CLIENT_BRAND } from '../constants';
 import { PolyClientError } from '../errors';
 import {
   AdapterErrorEvent,
+  ApplyWorkspaceEditResult,
   DiagnosticsEvent,
   DocumentChange,
   LanguageAdapter,
@@ -14,6 +15,9 @@ import {
   RegisteredLanguage,
   RequestContext,
   TextDocument,
+  TextDocumentEdit,
+  TextEdit,
+  WorkspaceDocumentChange,
   WorkspaceEdit,
   WorkspaceEvent,
 } from '../types';
@@ -426,52 +430,222 @@ export class PolyClient implements PolyClientApi {
     return new Subscription(() => this.errorListeners.delete(listener));
   }
 
-  applyWorkspaceEdit(edit: WorkspaceEdit): { applied: boolean; failures: { uri: string; reason: string }[] } {
+  applyWorkspaceEdit(edit: WorkspaceEdit): ApplyWorkspaceEditResult {
     this.assertNotDisposed();
     if (!edit || typeof edit !== 'object') {
       throw new PolyClientError('INVALID_EDIT', 'Workspace edit must be an object.');
     }
 
     const failures: { uri: string; reason: string }[] = [];
+    let failedChangeIndex: number | undefined;
+
+    const recordFailure = (uri: string, reason: string, index?: number) => {
+      failures.push({ uri, reason });
+      if (failedChangeIndex === undefined && typeof index === 'number' && Number.isInteger(index)) {
+        failedChangeIndex = index;
+      }
+    };
+
+    const handleTextDocumentEdit = (change: TextDocumentEdit, index: number) => {
+      const uri = change?.textDocument?.uri;
+      if (typeof uri !== 'string' || uri.length === 0) {
+        recordFailure('', 'Missing textDocument URI', index);
+        return;
+      }
+      let normalizedUri: string;
+      try {
+        normalizedUri = normalizeUri(uri);
+      } catch (error) {
+        recordFailure(uri, (error as Error).message, index);
+        return;
+      }
+      const document = this.documents.get(normalizedUri);
+      if (!document) {
+        recordFailure(uri, 'Document not open', index);
+        return;
+      }
+      const edits = Array.isArray(change.edits) ? change.edits : [];
+      if (!edits.length) {
+        return;
+      }
+      try {
+        const normalizedEdits: TextEdit[] = [];
+        for (const item of edits) {
+          const range = (item as { range?: DocumentChange['range'] }).range;
+          if (!range) {
+            recordFailure(uri, 'Text edit range missing', index);
+            return;
+          }
+          const newTextValue = (item as { newText?: string }).newText;
+          normalizedEdits.push({ range, newText: typeof newTextValue === 'string' ? newTextValue : '' });
+        }
+        const newText = applyTextEdits(document.text, normalizedEdits);
+        document.text = newText;
+        document.version += 1;
+        const record = this.languages.get(document.languageId);
+        const changes = normalizedEdits.map((edit) => ({ range: edit.range, text: edit.newText }));
+        this.callAdapterHandler(record, 'updateDocument', record?.handlers.updateDocument, {
+          uri: document.uri,
+          languageId: document.languageId,
+          version: document.version,
+          text: document.text,
+          changes: changes.length > 0 ? changes : [{ text: document.text }],
+        });
+      } catch (error) {
+        recordFailure(uri, (error as Error).message, index);
+        if (typeof edit.documentChanges !== 'undefined') {
+          throw Object.assign(error instanceof Error ? error : new Error(String(error)), { index });
+        }
+      }
+    };
+
+    const processChange = (change: WorkspaceDocumentChange, index: number) => {
+      if (!change || typeof change !== 'object') {
+        return;
+      }
+      if ('kind' in change) {
+        if (change.kind === 'rename') {
+          const { oldUri, newUri } = change as { oldUri?: string; newUri?: string };
+          if (typeof oldUri !== 'string' || typeof newUri !== 'string') {
+            recordFailure(String(oldUri ?? newUri ?? ''), 'Invalid rename change', index);
+            return;
+          }
+          let normalizedOld: string;
+          let normalizedNew: string;
+          try {
+            normalizedOld = normalizeUri(oldUri);
+            normalizedNew = normalizeUri(newUri);
+          } catch (error) {
+            recordFailure(oldUri, (error as Error).message, index);
+            return;
+          }
+          if (!this.documents.has(normalizedOld)) {
+            recordFailure(oldUri, 'Document not open', index);
+            return;
+          }
+          const document = this.documents.get(normalizedOld)!;
+          this.documents.delete(normalizedOld);
+          document.uri = normalizedNew;
+          this.documents.set(normalizedNew, document);
+          const record = this.languages.get(document.languageId);
+          this.callAdapterHandler(record, 'closeDocument', record?.handlers.closeDocument, { uri: normalizedOld });
+          this.callAdapterHandler(record, 'openDocument', record?.handlers.openDocument, {
+            uri: normalizedNew,
+            languageId: document.languageId,
+            version: document.version,
+            text: document.text,
+          });
+          return;
+        }
+        recordFailure(
+          'kind' in change && typeof (change as { uri?: string }).uri === 'string'
+            ? (change as { uri: string }).uri
+            : '',
+          `Unsupported workspace edit change kind: ${(change as { kind: string }).kind}`,
+          index,
+        );
+        return;
+      }
+      handleTextDocumentEdit(change as TextDocumentEdit, index);
+    };
+
+    let changeCounter = 0;
+
+    try {
+      if (Array.isArray(edit.documentChanges)) {
+        edit.documentChanges.forEach((change) => {
+          processChange(change, changeCounter);
+          changeCounter += 1;
+        });
+      }
+    } catch (error) {
+      // Already recorded failure inside handlers
+    }
 
     if (edit.changes && typeof edit.changes === 'object') {
       const entries = Object.entries(edit.changes);
       for (const [uri, edits] of entries) {
-        let normalizedUri: string;
-        try {
-          normalizedUri = normalizeUri(uri);
-        } catch (error) {
-          failures.push({ uri, reason: (error as Error).message });
-          continue;
-        }
-        const document = this.documents.get(normalizedUri);
-        if (!document) {
-          failures.push({ uri, reason: 'Document not open' });
-          continue;
-        }
-        try {
-          if (!Array.isArray(edits) || edits.length === 0) {
-            continue;
-          }
-          const newText = applyTextEdits(document.text, edits);
-          document.text = newText;
-          document.version += 1;
-          const record = this.languages.get(document.languageId);
-          const changes = edits.map((edit) => ({ range: edit.range, text: edit.newText }));
-          this.callAdapterHandler(record, 'updateDocument', record?.handlers.updateDocument, {
-            uri: document.uri,
-            languageId: document.languageId,
-            version: document.version,
-            text: document.text,
-            changes: changes.length > 0 ? changes : [{ text: document.text }],
-          });
-        } catch (error) {
-          failures.push({ uri, reason: (error as Error).message });
-        }
+        const textDocumentEdit: TextDocumentEdit = {
+          textDocument: { uri },
+          edits: Array.isArray(edits) ? edits : [],
+        };
+        handleTextDocumentEdit(textDocumentEdit, changeCounter);
+        changeCounter += 1;
       }
     }
 
-    return { applied: failures.length === 0, failures };
+    const result: ApplyWorkspaceEditResult = {
+      applied: failures.length === 0,
+      failures,
+    };
+
+    if (!result.applied && failures.length > 0) {
+      result.failureReason = failures[0].reason;
+      result.failedChange = failedChangeIndex ?? 0;
+    }
+
+    return result;
+  }
+
+  private async handleServerRequest(
+    method: string,
+    params: unknown,
+    languageId: string,
+  ): Promise<unknown> {
+    switch (method) {
+      case 'workspace/applyEdit': {
+        const payload = (params ?? {}) as { edit?: WorkspaceEdit; label?: string };
+        if (!payload || typeof payload !== 'object' || typeof payload.edit !== 'object') {
+          return { applied: false, failureReason: 'Invalid workspace edit payload' };
+        }
+        const result = this.applyWorkspaceEdit(payload.edit as WorkspaceEdit);
+        const response: Record<string, unknown> = { applied: result.applied };
+        if (!result.applied) {
+          response.failureReason = result.failureReason ?? 'Workspace edit failed';
+          if (typeof result.failedChange === 'number') {
+            response.failedChange = result.failedChange;
+          }
+        }
+        return response;
+      }
+      case 'workspace/configuration': {
+        const items = Array.isArray((params as { items?: unknown[] } | null | undefined)?.items)
+          ? ((params as { items: unknown[] }).items)
+          : [];
+        return items.map(() => ({}));
+      }
+      case 'window/showMessageRequest': {
+        const actions = Array.isArray((params as { actions?: unknown[] } | null | undefined)?.actions)
+          ? ((params as { actions: unknown[] }).actions)
+          : [];
+        return actions.length > 0 ? actions[0] : null;
+      }
+      case 'client/registerCapability':
+      case 'client/unregisterCapability':
+      case 'workspace/didChangeWorkspaceFolders':
+        return null;
+      case 'workspace/workspaceFolders': {
+        return this.workspaceFolders.map((folder) => ({ uri: folder, name: folder.split(/[\\/]/).pop() ?? folder }));
+      }
+      default: {
+        const listeners = this.notificationListeners.get(method);
+        if (!listeners || listeners.size === 0) {
+          return null;
+        }
+        let response: unknown = null;
+        for (const listener of Array.from(listeners)) {
+          try {
+            const result = listener(params, languageId);
+            if (result !== undefined) {
+              response = result;
+            }
+          } catch {
+            // Ignore listener failures for server requests
+          }
+        }
+        return response ?? null;
+      }
+    }
   }
 
   async dispose(): Promise<void> {
@@ -829,6 +1003,9 @@ export class PolyClient implements PolyClientApi {
           listener(payload, record.languageId);
         }
       },
+      handleServerRequest: (method: string, payload: unknown) =>
+        this.handleServerRequest(method, payload, record.languageId),
+      applyWorkspaceEdit: (workspaceEdit: WorkspaceEdit) => this.applyWorkspaceEdit(workspaceEdit),
       registerDisposable: (dispose: () => void | Promise<void>) => {
         if (typeof dispose !== 'function') {
           return;
