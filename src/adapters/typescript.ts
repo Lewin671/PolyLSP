@@ -1,10 +1,11 @@
 import { ChildProcess, spawn } from 'child_process';
-import path from 'node:path';
-import { LanguageAdapter, LanguageRegistrationContext } from '../types';
+import path from 'path';
+import { DocumentChange, LanguageAdapter, LanguageRegistrationContext } from '../types';
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (error?: unknown) => void;
+  timeout: ReturnType<typeof setTimeout>;
 };
 
 function resolveServerEntry(): string {
@@ -39,6 +40,7 @@ export function createTypeScriptAdapter(): LanguageAdapter {
     if (message.id !== undefined && pendingRequests.has(message.id)) {
       const pending = pendingRequests.get(message.id)!;
       pendingRequests.delete(message.id);
+      clearTimeout(pending.timeout);
       if (message.error) {
         pending.reject(message.error);
       } else {
@@ -105,6 +107,7 @@ export function createTypeScriptAdapter(): LanguageAdapter {
     serverProcess.on('close', () => {
       serverProcess = null;
       for (const [, pending] of pendingRequests) {
+        clearTimeout(pending.timeout);
         pending.reject(new Error('typescript-language-server exited'));
       }
       pendingRequests.clear();
@@ -127,6 +130,21 @@ export function createTypeScriptAdapter(): LanguageAdapter {
     serverProcess.stdin.write(payload);
   };
 
+  const stopServer = async () => {
+    if (!serverProcess) {
+      return;
+    }
+    const proc = serverProcess;
+    await new Promise<void>((resolve) => {
+      (proc as any).once('close', resolve);
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        resolve();
+      }
+    });
+  };
+
   const sendRawRequest = (method: string, params: unknown): Promise<unknown> => {
     ensureServer();
     const id = ++requestId;
@@ -134,21 +152,22 @@ export function createTypeScriptAdapter(): LanguageAdapter {
     const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
 
     return new Promise((resolve, reject) => {
-      pendingRequests.set(id, { resolve, reject });
-      try {
-        writeMessage(content);
-      } catch (error) {
-        pendingRequests.delete(id);
-        reject(error);
-        return;
-      }
-
-      setTimeout(() => {
+      const timeout = setTimeout(() => {
         if (pendingRequests.has(id)) {
           pendingRequests.delete(id);
           reject(new Error(`typescript-language-server request "${method}" timed out.`));
         }
       }, 15000);
+
+      pendingRequests.set(id, { resolve, reject, timeout });
+      try {
+        writeMessage(content);
+      } catch (error) {
+        pendingRequests.delete(id);
+        clearTimeout(timeout);
+        reject(error);
+        return;
+      }
     });
   };
 
@@ -243,25 +262,33 @@ export function createTypeScriptAdapter(): LanguageAdapter {
       if (!serverProcess) return;
       if (initialized) {
         try {
+          let timeoutHandle: ReturnType<typeof setTimeout>;
           await Promise.race([
-            sendRequest('shutdown', {}),
-            new Promise((resolve) => setTimeout(resolve, 2000)),
+            sendRequest('shutdown', {}).finally(() => {
+              if (timeoutHandle) {
+                clearTimeout(timeoutHandle);
+              }
+            }),
+            new Promise<void>((resolve) => {
+              timeoutHandle = setTimeout(resolve, 2000);
+            }),
           ]);
           sendNotification('exit', {});
         } catch (error) {
-          console.error('Error shutting down typescript-language-server:', error);
+          const message = error instanceof Error ? error.message : String(error);
+          if (!/typescript-language-server (?:exited|shutdown)/i.test(message)) {
+            console.error('Error shutting down typescript-language-server:', error);
+          }
         }
       }
 
       for (const [, pending] of pendingRequests) {
+        clearTimeout(pending.timeout);
         pending.reject(new Error('typescript-language-server shutdown'));
       }
       pendingRequests.clear();
 
-      if (serverProcess) {
-        serverProcess.kill('SIGTERM');
-        serverProcess = null;
-      }
+      await stopServer();
       initialized = false;
       registrationContext = null;
     },
@@ -275,6 +302,31 @@ export function createTypeScriptAdapter(): LanguageAdapter {
           version: params.version,
           text: params.text,
         },
+      });
+    },
+
+    updateDocument: (params: {
+      uri: string;
+      languageId: string;
+      version: number;
+      text: string;
+      changes: DocumentChange[];
+    }) => {
+      ensureInitialized().catch(() => undefined);
+      const contentChanges = Array.isArray(params.changes) && params.changes.length > 0
+        ? params.changes.map((change) => {
+            if (change.range) {
+              return { range: change.range, text: change.text };
+            }
+            return { text: change.text };
+          })
+        : [{ text: params.text }];
+      sendNotification('textDocument/didChange', {
+        textDocument: {
+          uri: params.uri,
+          version: params.version,
+        },
+        contentChanges,
       });
     },
 
@@ -301,10 +353,10 @@ export function createTypeScriptAdapter(): LanguageAdapter {
       return ensureInitialized(ctx);
     },
     handlers,
-    dispose: () => {
-      if (serverProcess) {
-        serverProcess.kill('SIGTERM');
-        serverProcess = null;
+    dispose: async () => {
+      await stopServer();
+      for (const [, pending] of pendingRequests) {
+        clearTimeout(pending.timeout);
       }
       pendingRequests.clear();
       registrationContext = null;

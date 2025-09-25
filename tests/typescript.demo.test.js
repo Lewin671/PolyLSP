@@ -19,10 +19,10 @@ const tsWorkspaceFolder = path.join(projectRoot, 'examples', 'ts-demo');
 const tsExamplePath = path.join(tsWorkspaceFolder, 'src', 'index.ts');
 const URI = `file://${tsExamplePath}`;
 
-function createTypeScriptHarness() {
+async function createTypeScriptHarness() {
   const client = createPolyClient({ workspaceFolders: [tsWorkspaceFolder] });
   const adapter = createTypeScriptAdapter();
-  registerLanguage(client, adapter);
+  await registerLanguage(client, adapter);
   const source = fs.readFileSync(tsExamplePath, 'utf8');
   client.openDocument({ uri: URI, languageId: 'typescript', text: source, version: 1 });
   return {
@@ -33,11 +33,11 @@ function createTypeScriptHarness() {
 }
 
 async function withTypeScriptHarness(run) {
-  const harness = createTypeScriptHarness();
+  const harness = await createTypeScriptHarness();
   try {
     await run(harness);
   } finally {
-    harness.dispose();
+    await harness.dispose();
   }
 }
 

@@ -11,6 +11,7 @@ const {
 const URI = 'file:///project/example.ts';
 
 function createMockAdapter(overrides = {}) {
+  const { handlers: handlerOverrides = {}, ...rest } = overrides;
   return {
     languageId: 'mock',
     handlers: {
@@ -19,8 +20,10 @@ function createMockAdapter(overrides = {}) {
         items: [{ label: 'hello' }],
       }),
       getHover: () => ({ contents: ['hover'] }),
+      getDocumentSymbols: () => [],
+      ...handlerOverrides,
     },
-    ...overrides,
+    ...rest,
   };
 }
 
@@ -43,12 +46,22 @@ test('registerLanguage resolves adapters and routes requests', async () => {
 
   const hover = client.getHover({ uri: URI, position: { line: 0, character: 3 } });
   assert.deepEqual(hover, { contents: ['hover'] });
-  client.dispose();
+  await client.dispose();
 });
 
-test('updateDocument applies ranged edits and enforces version ordering', () => {
+test('updateDocument applies ranged edits, enforces version ordering, and notifies adapters', async () => {
   const client = createPolyClient();
-  registerLanguage(client, createMockAdapter());
+  const updates = [];
+  const adapter = createMockAdapter({
+    handlers: {
+      getCompletions: () => ({ items: [] }),
+      getHover: () => null,
+      updateDocument: (payload) => {
+        updates.push(payload);
+      },
+    },
+  });
+  await registerLanguage(client, adapter);
   client.openDocument({
     uri: URI,
     languageId: 'mock',
@@ -82,10 +95,15 @@ test('updateDocument applies ranged edits and enforces version ordering', () => 
     'const count = 1;\nconsole.log(count);\n',
   );
 
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].version, 2);
+  assert.equal(updates[0].changes.length, 2);
+  assert.equal(updates[0].text.includes('count'), true);
+
   assert.throws(() => {
     client.updateDocument({ uri: URI, version: 3, changes: [] });
   }, (error) => error instanceof PolyClientError && error.code === 'INVALID_CHANGES');
-  client.dispose();
+  await client.dispose();
 });
 
 test('diagnostics listeners receive payloads published by adapters', async () => {
@@ -111,12 +129,20 @@ test('diagnostics listeners receive payloads published by adapters', async () =>
   assert.equal(received[0].diagnostics[0].message, 'Issue');
 
   sub.unsubscribe();
-  client.dispose();
+  await client.dispose();
 });
 
-test('applyWorkspaceEdit mutates open documents', () => {
+test('applyWorkspaceEdit mutates open documents and synchronizes with adapters', async () => {
   const client = createPolyClient();
-  registerLanguage(client, createMockAdapter());
+  const updatePayloads = [];
+  const base = createMockAdapter();
+  await registerLanguage(client, {
+    ...base,
+    handlers: {
+      ...base.handlers,
+      updateDocument: (payload) => updatePayloads.push(payload),
+    },
+  });
   client.openDocument({ uri: URI, languageId: 'mock', text: 'function add() {\n  return 1;\n}\n', version: 1 });
 
   const result = client.applyWorkspaceEdit({
@@ -134,6 +160,9 @@ test('applyWorkspaceEdit mutates open documents', () => {
   });
 
   assert.equal(result.applied, true);
+  assert.equal(updatePayloads.length, 1);
+  assert.equal(updatePayloads[0].version, 2);
+  assert.equal(updatePayloads[0].text.includes('return 2'), true);
 
   const updated = client.updateDocument({
     uri: URI,
@@ -141,7 +170,7 @@ test('applyWorkspaceEdit mutates open documents', () => {
     changes: [{ text: 'function add() {\n  return 2;\n}\n' }],
   });
   assert.equal(updated.text.includes('return 2'), true);
-  client.dispose();
+  await client.dispose();
 });
 
 test('workspace events notify listeners', async () => {
@@ -165,7 +194,7 @@ test('workspace events notify listeners', async () => {
   assert.equal(events[0].languageId, 'workspace');
 
   subscription.unsubscribe();
-  client.dispose();
+  await client.dispose();
 });
 
 test('sendNotification delegates to adapters when available', async () => {
@@ -184,7 +213,7 @@ test('sendNotification delegates to adapters when available', async () => {
   client.sendNotification('custom', { uri: URI, payload: 1 });
   assert.equal(received.length, 1);
   assert.equal(received[0].method, 'custom');
-  client.dispose();
+  await client.dispose();
 });
 
 test('unregisterLanguage disposes adapters', async () => {
@@ -199,11 +228,21 @@ test('unregisterLanguage disposes adapters', async () => {
   const removed = unregisterLanguage(client, 'temp');
   assert.equal(removed, true);
   assert.equal(disposed, true);
-  client.dispose();
+  await client.dispose();
 });
 
-test('invalid inputs surface descriptive errors', () => {
+test('invalid inputs surface descriptive errors', async () => {
   const client = createPolyClient();
   assert.throws(() => client.openDocument({ uri: URI, languageId: 'none' }), PolyClientError);
-  client.dispose();
+  await client.dispose();
+});
+
+test('resolveLanguageFromParams falls back to sole registered language', async () => {
+  const client = createPolyClient();
+  await registerLanguage(client, createMockAdapter());
+  client.openDocument({ uri: URI, languageId: 'mock', text: 'console.log(1);', version: 1 });
+
+  const result = client.getDocumentSymbols({ query: 'anything' });
+  assert.equal(Array.isArray(result), true);
+  await client.dispose();
 });

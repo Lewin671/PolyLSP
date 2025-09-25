@@ -84,12 +84,20 @@ export type LanguageRegistrationContext = {
   listDocuments(): TextDocument[];
   getRegisteredLanguages(): string[];
   notifyClient: NotifyClient;
+  registerDisposable(dispose: () => void | Promise<void>): void;
 };
 
 export type LanguageHandlers = {
   initialize?: (context: LanguageRegistrationContext) => MaybePromise<unknown>;
   shutdown?: () => MaybePromise<void>;
   openDocument?: (params: { uri: string; languageId: string; text: string; version: number }) => MaybePromise<void>;
+  updateDocument?: (params: {
+    uri: string;
+    languageId: string;
+    version: number;
+    text: string;
+    changes: DocumentChange[];
+  }) => MaybePromise<void>;
   closeDocument?: (params: { uri: string }) => MaybePromise<void>;
   getCompletions?: (params: unknown, context: RequestContext) => MaybePromise<unknown>;
   getHover?: (params: unknown, context: RequestContext) => MaybePromise<unknown>;
@@ -119,7 +127,7 @@ export type LanguageAdapter = {
 export type RegisteredLanguage = {
   languageId: string;
   displayName: string;
-  state: string;
+  state: 'registering' | 'initializing' | 'ready' | 'failed' | 'disposed';
   capabilities: Record<string, unknown>;
   registeredAt: Date;
 };
@@ -151,5 +159,5 @@ export interface PolyClient {
   onDiagnostics(uri: string, listener: Listener<DiagnosticsEvent>): Disposable;
   onWorkspaceEvent(kind: string, listener: Listener<WorkspaceEvent>): Disposable;
   applyWorkspaceEdit(edit: WorkspaceEdit): { applied: boolean; failures: { uri: string; reason: string }[] };
-  dispose(): void;
+  dispose(): MaybePromise<void>;
 }
