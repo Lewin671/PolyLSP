@@ -4,6 +4,7 @@ import {
   DiagnosticsEvent,
   DocumentChange,
   LanguageAdapter,
+  LanguageRegistrationContext,
   LanguageHandlers,
   Listener,
   MaybePromise,
@@ -29,11 +30,34 @@ type AdapterRecord = {
   displayName: string;
   capabilities: Record<string, unknown>;
   handlers: LanguageHandlers;
-  state: 'registering' | 'initializing' | 'ready';
-  initializedAt: Date;
+  state: 'registering' | 'initializing' | 'ready' | 'failed' | 'disposed';
+  registeredAt: Date;
+  initializedAt: Date | null;
   dispose?: () => void | Promise<void>;
   data: unknown;
+  disposables: Set<() => void | Promise<void>>;
+  initializationError?: unknown;
 };
+
+const HANDLER_METHODS: (keyof LanguageHandlers)[] = [
+  'initialize',
+  'shutdown',
+  'openDocument',
+  'updateDocument',
+  'closeDocument',
+  'getCompletions',
+  'getHover',
+  'getDefinition',
+  'findReferences',
+  'getCodeActions',
+  'getDocumentHighlights',
+  'getDocumentSymbols',
+  'renameSymbol',
+  'formatDocument',
+  'formatRange',
+  'sendRequest',
+  'sendNotification',
+];
 
 export class PolyClient implements PolyClientApi {
   public transport: string;
@@ -52,7 +76,7 @@ export class PolyClient implements PolyClientApi {
 
   private readonly notificationListeners = new Map<string, Set<NotificationListener>>();
 
-  private readonly disposables = new Set<() => void>();
+  private readonly disposables = new Set<() => void | Promise<void>>();
 
   private disposed = false;
 
@@ -91,40 +115,61 @@ export class PolyClient implements PolyClientApi {
       throw new PolyClientError('LANGUAGE_EXISTS', `Language "${languageId}" is already registered.`);
     }
 
+    const handlers: LanguageHandlers = { ...(adapter.handlers ?? {}) };
+    if (!adapter.handlers) {
+      for (const key of HANDLER_METHODS) {
+        const candidate = (adapter as Record<string, unknown>)[key as string];
+        if (typeof candidate === 'function') {
+          handlers[key] = candidate as never;
+        }
+      }
+    }
+
     const record: AdapterRecord = {
       languageId,
       adapter,
       displayName: adapter.displayName || languageId,
       capabilities: cloneValue(adapter.capabilities) || {},
-      handlers: (adapter.handlers ?? adapter) as LanguageHandlers,
+      handlers,
       state: 'registering',
-      initializedAt: new Date(),
+      registeredAt: new Date(),
+      initializedAt: null,
       dispose: adapter.dispose,
       data: {},
+      disposables: new Set(),
     };
 
     this.languages.set(languageId, record);
 
-    if (typeof adapter.initialize === 'function') {
-      const context = this.createAdapterContext(record);
-      const result = adapter.initialize(context);
-      if (result && typeof (result as Promise<unknown>).then === 'function') {
-        record.state = 'initializing';
-        return (result as Promise<unknown>)
-          .then((value) => {
-            record.state = 'ready';
-            record.data = value ?? record.data;
-            return record.languageId;
-          })
-          .catch((error) => {
-            this.languages.delete(languageId);
-            throw error;
-          });
-      }
-      record.data = result ?? record.data;
+    const initialize = this.resolveInitialize(adapter, handlers);
+    if (!initialize) {
+      record.state = 'ready';
+      record.initializedAt = new Date();
+      return record.languageId;
+    }
+
+    record.state = 'initializing';
+    const context = this.createAdapterContext(record);
+    const result = initialize(context);
+    if (this.isThenable(result)) {
+      return result
+        .then((value) => {
+          record.state = 'ready';
+          record.initializedAt = new Date();
+          record.data = value ?? record.data;
+          return record.languageId;
+        })
+        .catch((error) => {
+          record.state = 'failed';
+          record.initializationError = error;
+          this.languages.delete(languageId);
+          throw error;
+        });
     }
 
     record.state = 'ready';
+    record.initializedAt = new Date();
+    record.data = result ?? record.data;
     return record.languageId;
   }
 
@@ -135,16 +180,18 @@ export class PolyClient implements PolyClientApi {
     }
 
     const record = this.languages.get(languageId)!;
-    if (typeof record.dispose === 'function') {
-      try {
-        record.dispose();
-      } catch (error) {
-        this.languages.delete(languageId);
-        throw error;
-      }
-    }
-
+    record.state = 'disposed';
     this.languages.delete(languageId);
+    try {
+      const cleanup = this.runRecordDisposables(record, false);
+      if (this.isThenable(cleanup)) {
+        cleanup.catch((error) => {
+          this.handleAdapterError('unregisterLanguage', record.languageId, error);
+        });
+      }
+    } catch (error) {
+      throw error;
+    }
     return true;
   }
 
@@ -155,7 +202,7 @@ export class PolyClient implements PolyClientApi {
       displayName: record.displayName,
       state: record.state,
       capabilities: cloneValue(record.capabilities),
-      registeredAt: record.initializedAt,
+      registeredAt: record.initializedAt ?? record.registeredAt,
     }));
   }
 
@@ -166,30 +213,28 @@ export class PolyClient implements PolyClientApi {
     version?: number;
   }): TextDocument {
     this.assertNotDisposed();
-    normalizeUri(uri);
+    const normalizedUri = normalizeUri(uri);
     if (!this.languages.has(languageId)) {
       throw new PolyClientError('UNKNOWN_LANGUAGE', `Language "${languageId}" is not registered.`);
     }
 
     const doc: TextDocument = {
-      uri,
+      uri: normalizedUri,
       languageId,
       text: typeof text === 'string' ? text : '',
       version: version >>> 0,
       openedAt: new Date(),
     };
 
-    this.documents.set(uri, doc);
+    this.documents.set(normalizedUri, doc);
 
-    // Notify the language adapter about the opened document
     const record = this.languages.get(languageId);
-    if (record && record.handlers.openDocument) {
-      try {
-        record.handlers.openDocument({ uri, languageId, text: doc.text, version: doc.version });
-      } catch (error) {
-        console.error(`Error notifying ${languageId} adapter about opened document:`, error);
-      }
-    }
+    this.callAdapterHandler(record, 'openDocument', record?.handlers.openDocument, {
+      uri: normalizedUri,
+      languageId,
+      text: doc.text,
+      version: doc.version,
+    });
 
     return cloneDocument(doc)!;
   }
@@ -200,7 +245,8 @@ export class PolyClient implements PolyClientApi {
     changes: DocumentChange[];
   }): TextDocument {
     this.assertNotDisposed();
-    const doc = this.documents.get(normalizeUri(uri));
+    const normalizedUri = normalizeUri(uri);
+    const doc = this.documents.get(normalizedUri);
     if (!doc) {
       throw new PolyClientError('DOCUMENT_NOT_OPEN', `Document "${uri}" is not open.`);
     }
@@ -220,6 +266,14 @@ export class PolyClient implements PolyClientApi {
 
     doc.text = text;
     doc.version = version;
+    const record = this.languages.get(doc.languageId);
+    this.callAdapterHandler(record, 'updateDocument', record?.handlers.updateDocument, {
+      uri: doc.uri,
+      languageId: doc.languageId,
+      version: doc.version,
+      text: doc.text,
+      changes: cloneValue(changes),
+    });
     return cloneDocument(doc)!;
   }
 
@@ -229,15 +283,8 @@ export class PolyClient implements PolyClientApi {
     const doc = this.documents.get(normalizedUri);
 
     if (doc) {
-      // Notify the language adapter about the closed document
       const record = this.languages.get(doc.languageId);
-      if (record && record.handlers.closeDocument) {
-        try {
-          record.handlers.closeDocument({ uri: normalizedUri });
-        } catch (error) {
-          console.error(`Error notifying ${doc.languageId} adapter about closed document:`, error);
-        }
-      }
+      this.callAdapterHandler(record, 'closeDocument', record?.handlers.closeDocument, { uri: normalizedUri });
     }
 
     return this.documents.delete(normalizedUri);
@@ -324,11 +371,11 @@ export class PolyClient implements PolyClientApi {
 
   onDiagnostics(uri: string, listener: Listener<DiagnosticsEvent>): Subscription {
     this.assertNotDisposed();
-    normalizeUri(uri);
+    const normalizedUri = normalizeUri(uri);
     if (typeof listener !== 'function') {
       throw new PolyClientError('INVALID_LISTENER', 'Listener must be a function.');
     }
-    const listeners = getOrCreateSet(this.diagnosticListeners, uri);
+    const listeners = getOrCreateSet(this.diagnosticListeners, normalizedUri);
     listeners.add(listener);
     return new Subscription(() => listeners.delete(listener));
   }
@@ -357,7 +404,14 @@ export class PolyClient implements PolyClientApi {
     if (edit.changes && typeof edit.changes === 'object') {
       const entries = Object.entries(edit.changes);
       for (const [uri, edits] of entries) {
-        const document = this.documents.get(uri);
+        let normalizedUri: string;
+        try {
+          normalizedUri = normalizeUri(uri);
+        } catch (error) {
+          failures.push({ uri, reason: (error as Error).message });
+          continue;
+        }
+        const document = this.documents.get(normalizedUri);
         if (!document) {
           failures.push({ uri, reason: 'Document not open' });
           continue;
@@ -366,6 +420,14 @@ export class PolyClient implements PolyClientApi {
           const newText = applyTextEdits(document.text, edits);
           document.text = newText;
           document.version += 1;
+          const record = this.languages.get(document.languageId);
+          this.callAdapterHandler(record, 'updateDocument', record?.handlers.updateDocument, {
+            uri: document.uri,
+            languageId: document.languageId,
+            version: document.version,
+            text: document.text,
+            changes: [{ text: document.text }],
+          });
         } catch (error) {
           failures.push({ uri, reason: (error as Error).message });
         }
@@ -375,39 +437,39 @@ export class PolyClient implements PolyClientApi {
     return { applied: failures.length === 0, failures };
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     if (this.disposed) return;
 
-    // Mark as disposed immediately to prevent new operations
     this.disposed = true;
 
-    // Dispose all registered disposables
+    const cleanupTasks: Promise<void>[] = [];
+
     for (const disposable of this.disposables) {
       try {
-        disposable();
-      } catch {
-        // ignore dispose errors
+        const result = disposable();
+        if (this.isThenable(result)) {
+          cleanupTasks.push(result.then(() => undefined).catch((error) => {
+            this.handleAdapterError('dispose', 'client', error);
+          }));
+        }
+      } catch (error) {
+        this.handleAdapterError('dispose', 'client', error);
       }
     }
+    this.disposables.clear();
 
-    // Shutdown all language adapters (fire-and-forget for synchronous dispose)
     for (const record of this.languages.values()) {
-      if (typeof record.dispose === 'function') {
-        try {
-          record.dispose();
-        } catch {
-          // ignore dispose errors
-        }
-      } else if (typeof record.handlers.shutdown === 'function') {
-        try {
-          record.handlers.shutdown();
-        } catch {
-          // ignore dispose errors
-        }
+      record.state = 'disposed';
+      const result = this.runRecordDisposables(record, true);
+      if (this.isThenable(result)) {
+        cleanupTasks.push(result);
       }
     }
 
-    // Clean up immediately - don't wait for async operations
+    if (cleanupTasks.length > 0) {
+      await Promise.allSettled(cleanupTasks);
+    }
+
     this.finalizeDispose();
   }
 
@@ -418,6 +480,108 @@ export class PolyClient implements PolyClientApi {
     this.workspaceListeners.clear();
     this.notificationListeners.clear();
     this.disposed = true;
+  }
+
+  private resolveInitialize(
+    adapter: LanguageAdapter,
+    handlers: LanguageHandlers,
+  ): ((context: LanguageRegistrationContext) => MaybePromise<unknown>) | null {
+    if (typeof adapter.initialize === 'function') {
+      return (context) => adapter.initialize!(context);
+    }
+    if (typeof handlers.initialize === 'function') {
+      return (context) => handlers.initialize!(context);
+    }
+    return null;
+  }
+
+  private callAdapterHandler<T>(
+    record: AdapterRecord | undefined,
+    operation: string,
+    handler: ((...args: any[]) => MaybePromise<T>) | undefined,
+    ...args: any[]
+  ): void {
+    if (!record || typeof handler !== 'function') {
+      return;
+    }
+    try {
+      const result = handler(...args);
+      if (this.isThenable(result)) {
+        result.catch((error) => this.handleAdapterError(operation, record.languageId, error));
+      }
+    } catch (error) {
+      this.handleAdapterError(operation, record.languageId, error);
+    }
+  }
+
+  private isThenable<T>(value: MaybePromise<T>): value is Promise<T> {
+    return !!value && typeof (value as Promise<T>).then === 'function';
+  }
+
+  private tryNormalizeUri(uri: string | undefined | null): string | null {
+    if (typeof uri !== 'string' || uri.length === 0) {
+      return null;
+    }
+    try {
+      return normalizeUri(uri);
+    } catch {
+      return null;
+    }
+  }
+
+  private runRecordDisposables(record: AdapterRecord, suppressErrors: boolean): Promise<void> | void {
+    const tasks: Promise<void>[] = [];
+
+    const schedule = (fn: (() => void | Promise<void>) | undefined, label: string) => {
+      if (typeof fn !== 'function') {
+        return;
+      }
+      try {
+        const result = fn();
+        if (this.isThenable(result)) {
+          const promise = result as Promise<void>;
+          const task = suppressErrors
+            ? promise.catch((error) => {
+                this.handleAdapterError(label, record.languageId, error);
+              })
+            : promise;
+          tasks.push(task.then(() => undefined));
+        }
+      } catch (error) {
+        if (suppressErrors) {
+          this.handleAdapterError(label, record.languageId, error);
+        } else {
+          throw error;
+        }
+      }
+    };
+
+    for (const dispose of Array.from(record.disposables)) {
+      schedule(dispose, 'dispose');
+    }
+    record.disposables.clear();
+
+    schedule(record.handlers.shutdown, 'shutdown');
+    schedule(record.dispose, 'dispose');
+
+    if (tasks.length === 0) {
+      return undefined;
+    }
+
+    return Promise.allSettled(tasks).then((results) => {
+      if (suppressErrors) {
+        return;
+      }
+      for (const outcome of results) {
+        if (outcome.status === 'rejected') {
+          throw outcome.reason;
+        }
+      }
+    });
+  }
+
+  private handleAdapterError(operation: string, languageId: string, error: unknown): void {
+    console.error(`[PolyLSP:${languageId}] ${operation} failed:`, error);
   }
 
   private forward(handlerName: keyof LanguageHandlers, params: unknown): MaybePromise<unknown> {
@@ -435,7 +599,7 @@ export class PolyClient implements PolyClientApi {
 
   private resolveLanguageFromParams(params: unknown): AdapterRecord | null {
     if (!params || typeof params !== 'object') {
-      return null;
+      return this.languages.size === 1 ? this.languages.values().next().value ?? null : null;
     }
 
     const bag = params as Record<string, unknown>;
@@ -446,37 +610,51 @@ export class PolyClient implements PolyClientApi {
     }
 
     const byUri = this.extractUri(bag);
-    if (byUri && this.documents.has(byUri)) {
-      const document = this.documents.get(byUri)!;
-      return this.languages.get(document.languageId) ?? null;
+    if (byUri) {
+      const document = this.documents.get(byUri);
+      if (document) {
+        return this.languages.get(document.languageId) ?? null;
+      }
     }
 
-    return null;
+    if (this.languages.size === 1) {
+      return this.languages.values().next().value ?? null;
+    }
+
+    return byLanguageId ? this.languages.get(byLanguageId) ?? null : null;
   }
 
   private extractLanguageId(data: Record<string, unknown>): string | undefined {
     if (typeof data.languageId === 'string') {
       return data.languageId;
     }
+    if (typeof data.language === 'string') {
+      return data.language;
+    }
     const textDocument = data.textDocument as Record<string, unknown> | undefined;
     if (textDocument && typeof textDocument.languageId === 'string') {
       return textDocument.languageId;
+    }
+    const document = data.document as Record<string, unknown> | undefined;
+    if (document && typeof document.languageId === 'string') {
+      return document.languageId;
     }
     return undefined;
   }
 
   private extractUri(data: Record<string, unknown>): string | undefined {
-    if (typeof data.uri === 'string') {
-      return data.uri;
-    }
-    const textDocument = data.textDocument as Record<string, unknown> | undefined;
-    if (textDocument && typeof textDocument.uri === 'string') {
-      return textDocument.uri;
-    }
-    const left = data.left as Record<string, unknown> | undefined;
-    const leftDoc = left?.textDocument as Record<string, unknown> | undefined;
-    if (leftDoc && typeof leftDoc.uri === 'string') {
-      return leftDoc.uri;
+    const candidates: Array<string | undefined> = [
+      typeof data.uri === 'string' ? data.uri : undefined,
+      (data.textDocument as Record<string, unknown> | undefined)?.uri as string | undefined,
+      (data.document as Record<string, unknown> | undefined)?.uri as string | undefined,
+      ((data.left as Record<string, unknown> | undefined)?.textDocument as Record<string, unknown> | undefined)?.uri as string | undefined,
+    ];
+
+    for (const candidate of candidates) {
+      const normalized = this.tryNormalizeUri(candidate);
+      if (normalized) {
+        return normalized;
+      }
     }
     return undefined;
   }
@@ -491,7 +669,11 @@ export class PolyClient implements PolyClientApi {
     };
 
     const resolveDocument = (uri: string): TextDocument | null => {
-      const doc = this.documents.get(uri);
+      const normalized = this.tryNormalizeUri(uri);
+      if (!normalized) {
+        return null;
+      }
+      const doc = this.documents.get(normalized);
       return cloneDocument(doc);
     };
 
@@ -517,6 +699,12 @@ export class PolyClient implements PolyClientApi {
           listener(payload, record.languageId);
         }
       },
+      registerDisposable: (dispose: () => void | Promise<void>) => {
+        if (typeof dispose !== 'function') {
+          return;
+        }
+        record.disposables.add(dispose);
+      },
     };
   }
 
@@ -526,18 +714,22 @@ export class PolyClient implements PolyClientApi {
       options: this.options,
       workspaceFolders: this.workspaceFolders.slice(),
       getDocument: (uri: string) => {
-        const document = this.documents.get(uri);
+        const normalized = this.tryNormalizeUri(uri);
+        if (!normalized) {
+          return null;
+        }
+        const document = this.documents.get(normalized);
         return cloneDocument(document);
       },
     };
   }
 
   private emitDiagnostics(uri: string, diagnostics: DiagnosticsEvent['diagnostics'], languageId: string): void {
-    normalizeUri(uri);
-    const listeners = this.diagnosticListeners.get(uri);
+    const normalizedUri = normalizeUri(uri);
+    const listeners = this.diagnosticListeners.get(normalizedUri);
     if (!listeners || listeners.size === 0) return;
     const payload: DiagnosticsEvent = {
-      uri,
+      uri: normalizedUri,
       languageId,
       diagnostics: Array.isArray(diagnostics) ? cloneValue(diagnostics) : [],
     };
