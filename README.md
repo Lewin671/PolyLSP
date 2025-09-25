@@ -8,6 +8,8 @@ PolyLSP 是一个面向多语言的 LSP（Language Server Protocol）客户端�
 - **模块化架构**：将连接管理、能力协商、文档同步、诊断处理等逻辑拆分为独立模块，减少耦合，便于替换与扩展。
 - **事件驱动的数据流**：使用可组合的事件流机制，让调用方能够监听/订阅语言服务回调（诊断、补全、跳转等）。
 - **框架无关性**：可嵌入到 CLI 工具、VS Code 插件、Web IDE 或后端服务中，无需依赖特定运行时。
+- **统一传输层抽象**：内置基于 JSON-RPC 的复用连接管理器，适配器仅需关心命令行参数与协议扩展，即可获得可靠的消息解析、请求排队与超时控制。
+- **健壮的生命周期管理**：完善语言注册状态机与文档同步逻辑，确保初始化失败、重试或进程崩溃时资源得到正确回收。
 
 ## 暴露的 TS API 规划
 > 下列接口命名基于规划中的核心实现，后续将以 `packages/core` 提供完整类型定义。调用方可通过这些 API 驱动常见 LSP 能力，同时保留向下兼容的原生请求通道。
@@ -36,9 +38,19 @@ PolyLSP 是一个面向多语言的 LSP（Language Server Protocol）客户端�
   - `client.onDiagnostics(uri, listener)`：订阅 `textDocument/publishDiagnostics`。
   - `client.applyWorkspaceEdit(edit)`：与语言服务器协作完成跨文件修改。
   - `client.onWorkspaceEvent(kind, listener)`：监听 `workspace/didChangeConfiguration` 等通知。
+  - `client.onError(listener)`：捕获适配器执行失败、进程退出等错误，便于上层统一处理。
 - **低层扩展能力**
   - `client.sendRequest(method, params)` / `client.sendNotification(method, params)`：直接转发自定义 LSP 扩展。
   - `client.onNotification(method, listener)`：监听扩展通知，方便适配 Language Server 自定义特性。
+
+> 从本版本开始，`sendRequest`/`sendNotification` 会在多语言同时在线时强制要求显式的 `languageId` 或文档 URI，以避免请求被错误路由到其他语言服务器。
+
+## 传输层与适配器复用
+
+- 新增 `JsonRpcConnection` 工具类封装了 Content-Length 帧解析、请求/响应匹配、超时控制与错误传播逻辑，TypeScript 与 Go 适配器均复用该组件，消除了过去重复实现的缓冲区拼接与队列管理代码。
+- 适配器在初始化阶段会自动排队文档同步与通知请求；当语言服务器准备就绪后，PolyClient 会按顺序冲洗队列，避免初始化过程中丢失 `didOpen`/`didChange`。
+- 初始化失败会触发 `onError` 事件，并保证执行 `shutdown`/`dispose` 清理流程，防止残留子进程或事件监听。
+- `applyWorkspaceEdit` 现会将增量 `TextEdit` 转换为对应的 `DocumentChange`，确保语言服务器与本地文本版本保持一致；`updateDocument` 允许空变更用于仅更新版本号的场景。
 
 ## 快速开始
 > 当前仓库处于初始化阶段，以下示例展示了规划中的使用方式，便于对整体 API 有直观认识。

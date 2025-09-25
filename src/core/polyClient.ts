@@ -1,6 +1,7 @@
 import { CLIENT_BRAND } from '../constants';
 import { PolyClientError } from '../errors';
 import {
+  AdapterErrorEvent,
   DiagnosticsEvent,
   DocumentChange,
   LanguageAdapter,
@@ -37,6 +38,13 @@ type AdapterRecord = {
   data: unknown;
   disposables: Set<() => void | Promise<void>>;
   initializationError?: unknown;
+  operationQueue: QueuedOperation[];
+};
+
+type QueuedOperation = {
+  operation: string;
+  handler: ((...args: any[]) => MaybePromise<unknown>) | undefined;
+  args: any[];
 };
 
 const HANDLER_METHODS: (keyof LanguageHandlers)[] = [
@@ -75,6 +83,8 @@ export class PolyClient implements PolyClientApi {
   private readonly workspaceListeners = new Map<string, Set<Listener<WorkspaceEvent>>>();
 
   private readonly notificationListeners = new Map<string, Set<NotificationListener>>();
+
+  private readonly errorListeners = new Set<Listener<AdapterErrorEvent>>();
 
   private readonly disposables = new Set<() => void | Promise<void>>();
 
@@ -137,6 +147,7 @@ export class PolyClient implements PolyClientApi {
       dispose: adapter.dispose,
       data: {},
       disposables: new Set(),
+      operationQueue: [],
     };
 
     this.languages.set(languageId, record);
@@ -145,6 +156,7 @@ export class PolyClient implements PolyClientApi {
     if (!initialize) {
       record.state = 'ready';
       record.initializedAt = new Date();
+      this.flushQueuedOperations(record);
       return record.languageId;
     }
 
@@ -157,12 +169,19 @@ export class PolyClient implements PolyClientApi {
           record.state = 'ready';
           record.initializedAt = new Date();
           record.data = value ?? record.data;
+          this.flushQueuedOperations(record);
           return record.languageId;
         })
         .catch((error) => {
           record.state = 'failed';
           record.initializationError = error;
+          this.flushQueuedOperations(record, error);
           this.languages.delete(languageId);
+          this.emitAdapterError('initialize', languageId, error);
+          const cleanup = this.runRecordDisposables(record, true);
+          if (this.isThenable(cleanup)) {
+            cleanup.catch(() => undefined);
+          }
           throw error;
         });
     }
@@ -170,6 +189,7 @@ export class PolyClient implements PolyClientApi {
     record.state = 'ready';
     record.initializedAt = new Date();
     record.data = result ?? record.data;
+    this.flushQueuedOperations(record);
     return record.languageId;
   }
 
@@ -255,24 +275,30 @@ export class PolyClient implements PolyClientApi {
       throw new PolyClientError('INVALID_VERSION', 'Document version must be greater than current version.');
     }
 
-    if (!Array.isArray(changes) || changes.length === 0) {
-      throw new PolyClientError('INVALID_CHANGES', 'Document changes must be a non-empty array.');
+    if (!Array.isArray(changes)) {
+      throw new PolyClientError('INVALID_CHANGES', 'Document changes must be an array.');
     }
 
     let text = doc.text;
-    for (const change of changes) {
-      text = applyContentChange(text, change);
+    if (changes.length > 0) {
+      for (const change of changes) {
+        text = applyContentChange(text, change);
+      }
+      doc.text = text;
     }
 
-    doc.text = text;
     doc.version = version;
     const record = this.languages.get(doc.languageId);
+    const outgoingChanges =
+      changes.length > 0
+        ? cloneValue(changes)
+        : [{ text: doc.text }];
     this.callAdapterHandler(record, 'updateDocument', record?.handlers.updateDocument, {
       uri: doc.uri,
       languageId: doc.languageId,
       version: doc.version,
       text: doc.text,
-      changes: cloneValue(changes),
+      changes: outgoingChanges,
     });
     return cloneDocument(doc)!;
   }
@@ -332,10 +358,9 @@ export class PolyClient implements PolyClientApi {
 
   sendRequest(method: string, params: unknown = {}): MaybePromise<unknown> {
     this.assertNotDisposed();
-    const record = this.resolveLanguageFromParams(params);
-    if (!record) {
-      throw new PolyClientError('UNKNOWN_LANGUAGE', 'Unable to resolve language for request.');
-    }
+    const operation = `sendRequest:${method}`;
+    const record = this.resolveLanguageFromParams(params, operation);
+    this.assertLanguageReady(record, operation);
     const handler = record.handlers?.sendRequest;
     if (typeof handler !== 'function') {
       throw new PolyClientError('FEATURE_UNSUPPORTED', `Language "${record.languageId}" does not handle sendRequest.`);
@@ -345,10 +370,9 @@ export class PolyClient implements PolyClientApi {
 
   sendNotification(method: string, params: unknown = {}): MaybePromise<unknown> {
     this.assertNotDisposed();
-    const record = this.resolveLanguageFromParams(params);
-    if (!record) {
-      throw new PolyClientError('UNKNOWN_LANGUAGE', 'Unable to resolve language for notification.');
-    }
+    const operation = `sendNotification:${method}`;
+    const record = this.resolveLanguageFromParams(params, operation);
+    this.assertLanguageReady(record, operation);
     const handler = record.handlers?.sendNotification;
     if (typeof handler !== 'function') {
       throw new PolyClientError('FEATURE_UNSUPPORTED', `Language "${record.languageId}" does not handle sendNotification.`);
@@ -393,6 +417,15 @@ export class PolyClient implements PolyClientApi {
     return new Subscription(() => listeners.delete(listener));
   }
 
+  onError(listener: Listener<AdapterErrorEvent>): Subscription {
+    this.assertNotDisposed();
+    if (typeof listener !== 'function') {
+      throw new PolyClientError('INVALID_LISTENER', 'Listener must be a function.');
+    }
+    this.errorListeners.add(listener);
+    return new Subscription(() => this.errorListeners.delete(listener));
+  }
+
   applyWorkspaceEdit(edit: WorkspaceEdit): { applied: boolean; failures: { uri: string; reason: string }[] } {
     this.assertNotDisposed();
     if (!edit || typeof edit !== 'object') {
@@ -417,16 +450,20 @@ export class PolyClient implements PolyClientApi {
           continue;
         }
         try {
+          if (!Array.isArray(edits) || edits.length === 0) {
+            continue;
+          }
           const newText = applyTextEdits(document.text, edits);
           document.text = newText;
           document.version += 1;
           const record = this.languages.get(document.languageId);
+          const changes = edits.map((edit) => ({ range: edit.range, text: edit.newText }));
           this.callAdapterHandler(record, 'updateDocument', record?.handlers.updateDocument, {
             uri: document.uri,
             languageId: document.languageId,
             version: document.version,
             text: document.text,
-            changes: [{ text: document.text }],
+            changes: changes.length > 0 ? changes : [{ text: document.text }],
           });
         } catch (error) {
           failures.push({ uri, reason: (error as Error).message });
@@ -479,6 +516,7 @@ export class PolyClient implements PolyClientApi {
     this.diagnosticListeners.clear();
     this.workspaceListeners.clear();
     this.notificationListeners.clear();
+    this.errorListeners.clear();
     this.disposed = true;
   }
 
@@ -504,6 +542,28 @@ export class PolyClient implements PolyClientApi {
     if (!record || typeof handler !== 'function') {
       return;
     }
+
+    if (record.state === 'registering' || record.state === 'initializing') {
+      record.operationQueue.push({ operation, handler, args });
+      return;
+    }
+
+    if (record.state !== 'ready') {
+      return;
+    }
+
+    this.invokeHandler(record, operation, handler, args);
+  }
+
+  private invokeHandler<T>(
+    record: AdapterRecord,
+    operation: string,
+    handler: ((...args: any[]) => MaybePromise<T>) | undefined,
+    args: any[],
+  ): void {
+    if (typeof handler !== 'function') {
+      return;
+    }
     try {
       const result = handler(...args);
       if (this.isThenable(result)) {
@@ -511,6 +571,22 @@ export class PolyClient implements PolyClientApi {
       }
     } catch (error) {
       this.handleAdapterError(operation, record.languageId, error);
+    }
+  }
+
+  private flushQueuedOperations(record: AdapterRecord, error?: unknown): void {
+    if (!record.operationQueue.length) {
+      return;
+    }
+    const queue = record.operationQueue.splice(0);
+    if (error) {
+      for (const item of queue) {
+        this.handleAdapterError(item.operation, record.languageId, error);
+      }
+      return;
+    }
+    for (const item of queue) {
+      this.invokeHandler(record, item.operation, item.handler, item.args);
     }
   }
 
@@ -531,6 +607,8 @@ export class PolyClient implements PolyClientApi {
 
   private runRecordDisposables(record: AdapterRecord, suppressErrors: boolean): Promise<void> | void {
     const tasks: Promise<void>[] = [];
+
+    record.operationQueue.length = 0;
 
     const schedule = (fn: (() => void | Promise<void>) | undefined, label: string) => {
       if (typeof fn !== 'function') {
@@ -582,14 +660,27 @@ export class PolyClient implements PolyClientApi {
 
   private handleAdapterError(operation: string, languageId: string, error: unknown): void {
     console.error(`[PolyLSP:${languageId}] ${operation} failed:`, error);
+    this.emitAdapterError(operation, languageId, error);
+  }
+
+  private emitAdapterError(operation: string, languageId: string, error: unknown): void {
+    if (this.errorListeners.size === 0) {
+      return;
+    }
+    const event: AdapterErrorEvent = { languageId, operation, error };
+    for (const listener of Array.from(this.errorListeners)) {
+      try {
+        listener(event);
+      } catch (listenerError) {
+        console.error('[PolyLSP] error listener failed:', listenerError);
+      }
+    }
   }
 
   private forward(handlerName: keyof LanguageHandlers, params: unknown): MaybePromise<unknown> {
     this.assertNotDisposed();
-    const record = this.resolveLanguageFromParams(params);
-    if (!record) {
-      throw new PolyClientError('UNKNOWN_LANGUAGE', 'Unable to resolve language for request.');
-    }
+    const record = this.resolveLanguageFromParams(params, String(handlerName));
+    this.assertLanguageReady(record, String(handlerName));
     const handler = record.handlers?.[handlerName];
     if (typeof handler !== 'function') {
       throw new PolyClientError('FEATURE_UNSUPPORTED', `Language "${record.languageId}" does not implement ${String(handlerName)}.`);
@@ -597,31 +688,70 @@ export class PolyClient implements PolyClientApi {
     return handler(params, this.createRequestContext(record));
   }
 
-  private resolveLanguageFromParams(params: unknown): AdapterRecord | null {
+  private resolveLanguageFromParams(params: unknown, operation: string): AdapterRecord {
     if (!params || typeof params !== 'object') {
-      return this.languages.size === 1 ? this.languages.values().next().value ?? null : null;
+      if (this.languages.size === 1) {
+        const only = this.languages.values().next().value as AdapterRecord | undefined;
+        if (only) {
+          return only;
+        }
+      }
+      throw new PolyClientError(
+        'LANGUAGE_NOT_RESOLVED',
+        `Unable to resolve language for ${operation}: include a languageId or document URI.`,
+      );
     }
 
     const bag = params as Record<string, unknown>;
-
     const byLanguageId = this.extractLanguageId(bag);
-    if (byLanguageId && this.languages.has(byLanguageId)) {
-      return this.languages.get(byLanguageId) ?? null;
+    if (byLanguageId) {
+      const record = this.languages.get(byLanguageId);
+      if (!record) {
+        throw new PolyClientError('UNKNOWN_LANGUAGE', `Language "${byLanguageId}" is not registered.`);
+      }
+      return record;
     }
 
     const byUri = this.extractUri(bag);
     if (byUri) {
       const document = this.documents.get(byUri);
-      if (document) {
-        return this.languages.get(document.languageId) ?? null;
+      if (!document) {
+        throw new PolyClientError('DOCUMENT_NOT_OPEN', `Document "${byUri}" is not open.`);
       }
+      const record = this.languages.get(document.languageId);
+      if (!record) {
+        throw new PolyClientError('UNKNOWN_LANGUAGE', `Language "${document.languageId}" is not registered.`);
+      }
+      return record;
     }
 
     if (this.languages.size === 1) {
-      return this.languages.values().next().value ?? null;
+      const only = this.languages.values().next().value as AdapterRecord | undefined;
+      if (only) {
+        return only;
+      }
     }
 
-    return byLanguageId ? this.languages.get(byLanguageId) ?? null : null;
+    throw new PolyClientError(
+      'LANGUAGE_NOT_RESOLVED',
+      `Unable to resolve language for ${operation}: include a languageId or document URI.`,
+    );
+  }
+
+  private assertLanguageReady(record: AdapterRecord, operation: string): void {
+    if (record.state === 'ready') {
+      return;
+    }
+    if (record.state === 'failed') {
+      throw new PolyClientError('LANGUAGE_FAILED', `Language "${record.languageId}" failed to initialize.`);
+    }
+    if (record.state === 'disposed') {
+      throw new PolyClientError('UNKNOWN_LANGUAGE', `Language "${record.languageId}" is not active.`);
+    }
+    throw new PolyClientError(
+      'LANGUAGE_NOT_READY',
+      `Language "${record.languageId}" is not ready to handle ${operation}.`,
+    );
   }
 
   private extractLanguageId(data: Record<string, unknown>): string | undefined {
