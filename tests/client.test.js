@@ -100,9 +100,42 @@ test('updateDocument applies ranged edits, enforces version ordering, and notifi
   assert.equal(updates[0].changes.length, 2);
   assert.equal(updates[0].text.includes('count'), true);
 
-  assert.throws(() => {
-    client.updateDocument({ uri: URI, version: 3, changes: [] });
-  }, (error) => error instanceof PolyClientError && error.code === 'INVALID_CHANGES');
+  const unchanged = client.updateDocument({ uri: URI, version: 3, changes: [] });
+  assert.equal(unchanged.version, 3);
+  assert.equal(unchanged.text.includes('count'), true);
+  assert.equal(updates.length, 2);
+  assert.equal(updates[1].changes.length, 1);
+  await client.dispose();
+});
+
+test('document operations queue until adapters finish initializing', async () => {
+  const client = createPolyClient();
+  const events = [];
+  let releaseInitialization = () => {};
+  const adapter = {
+    languageId: 'queued',
+    async initialize() {
+      await new Promise((resolve) => { releaseInitialization = resolve; });
+    },
+    handlers: {
+      openDocument(payload) {
+        events.push({ type: 'open', payload });
+      },
+      updateDocument(payload) {
+        events.push({ type: 'update', payload });
+      },
+    },
+  };
+
+  const registration = registerLanguage(client, adapter);
+  client.openDocument({ uri: URI, languageId: 'queued', text: 'const value = 1;', version: 1 });
+  client.updateDocument({ uri: URI, version: 2, changes: [{ text: 'const value = 1;' }] });
+  releaseInitialization();
+  await registration;
+
+  assert.equal(events.length, 2);
+  assert.equal(events[0].type, 'open');
+  assert.equal(events[1].type, 'update');
   await client.dispose();
 });
 
@@ -216,6 +249,29 @@ test('sendNotification delegates to adapters when available', async () => {
   await client.dispose();
 });
 
+test('onError listeners receive adapter failures', async () => {
+  const client = createPolyClient();
+  const events = [];
+  client.onError((event) => events.push(event));
+
+  await registerLanguage(client, {
+    languageId: 'faulty',
+    handlers: {
+      updateDocument() {
+        throw new Error('boom');
+      },
+    },
+  });
+
+  client.openDocument({ uri: URI, languageId: 'faulty', text: 'const x = 1;', version: 1 });
+  client.updateDocument({ uri: URI, version: 2, changes: [{ text: 'const x = 2;' }] });
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].languageId, 'faulty');
+  assert.equal(events[0].operation, 'updateDocument');
+  await client.dispose();
+});
+
 test('unregisterLanguage disposes adapters', async () => {
   const client = createPolyClient();
   let disposed = false;
@@ -244,5 +300,17 @@ test('resolveLanguageFromParams falls back to sole registered language', async (
 
   const result = client.getDocumentSymbols({ query: 'anything' });
   assert.equal(Array.isArray(result), true);
+  await client.dispose();
+});
+
+test('requests without language context fail when ambiguous', async () => {
+  const client = createPolyClient();
+  await registerLanguage(client, createMockAdapter({ languageId: 'one' }));
+  await registerLanguage(client, createMockAdapter({ languageId: 'two' }));
+
+  assert.throws(() => client.sendRequest('ping', {}), (error) => {
+    return error instanceof PolyClientError && error.code === 'LANGUAGE_NOT_RESOLVED';
+  });
+
   await client.dispose();
 });

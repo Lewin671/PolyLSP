@@ -43,6 +43,12 @@ export type WorkspaceEvent<T = unknown> = {
   payload: T;
 };
 
+export type AdapterErrorEvent = {
+  languageId: string;
+  operation: string;
+  error: unknown;
+};
+
 export type Listener<T> = (event: T) => void;
 
 export interface Disposable {
@@ -158,6 +164,7 @@ export interface PolyClient {
   onNotification(method: string, listener: Listener<unknown>): Disposable;
   onDiagnostics(uri: string, listener: Listener<DiagnosticsEvent>): Disposable;
   onWorkspaceEvent(kind: string, listener: Listener<WorkspaceEvent>): Disposable;
+  onError(listener: Listener<AdapterErrorEvent>): Disposable;
   applyWorkspaceEdit(edit: WorkspaceEdit): { applied: boolean; failures: { uri: string; reason: string }[] };
   dispose(): MaybePromise<void>;
 }

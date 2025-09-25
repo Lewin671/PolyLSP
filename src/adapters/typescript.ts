@@ -1,12 +1,13 @@
-import { ChildProcess, spawn } from 'child_process';
+import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import path from 'path';
-import { DocumentChange, LanguageAdapter, LanguageRegistrationContext } from '../types';
-
-type PendingRequest = {
-  resolve: (value: unknown) => void;
-  reject: (error?: unknown) => void;
-  timeout: ReturnType<typeof setTimeout>;
-};
+import { pathToFileURL } from 'url';
+import {
+  DocumentChange,
+  LanguageAdapter,
+  LanguageRegistrationContext,
+  LanguageHandlers,
+} from '../types';
+import { JsonRpcConnection } from '../utils/jsonRpc';
 
 function resolveServerEntry(): string {
   const override = typeof process !== 'undefined' ? process.env?.POLY_TYPESCRIPT_LANGUAGE_SERVER_PATH : undefined;
@@ -17,203 +18,118 @@ function resolveServerEntry(): string {
   try {
     return require.resolve('typescript-language-server/lib/cli.js');
   } catch (error) {
-    throw new Error(
-      'Unable to resolve typescript-language-server. Please install "typescript-language-server" as a dependency.'
-    );
+    throw new Error('Unable to resolve typescript-language-server. Please install "typescript-language-server" as a dependency.');
   }
 }
+
+type PendingNotification = { method: string; params: unknown };
+
+type InitializationState = {
+  result: unknown;
+  timestamp: number;
+};
+
+const DEFAULT_REQUEST_TIMEOUT = 15000;
 
 export function createTypeScriptAdapter(): LanguageAdapter {
   const serverEntry = resolveServerEntry();
 
-  let serverProcess: ChildProcess | null = null;
-  let buffer = '';
-  let requestId = 0;
-  let initialized = false;
+  let child: ChildProcessWithoutNullStreams | null = null;
+  let connection: JsonRpcConnection | null = null;
   let registrationContext: LanguageRegistrationContext | null = null;
-  let initializationResult: unknown = null;
-  let initPromise: Promise<unknown> | null = null;
-  const pendingRequests = new Map<number, PendingRequest>();
-  const pendingNotifications: { method: string; params: unknown }[] = [];
+  let initialized = false;
+  let initializing: Promise<InitializationState> | null = null;
+  let lastInitialization: InitializationState | null = null;
+  const pendingNotifications: PendingNotification[] = [];
 
-  const handleMessage = (message: any) => {
-    if (message.id !== undefined && pendingRequests.has(message.id)) {
-      const pending = pendingRequests.get(message.id)!;
-      pendingRequests.delete(message.id);
-      clearTimeout(pending.timeout);
-      if (message.error) {
-        pending.reject(message.error);
-      } else {
-        pending.resolve(message.result ?? null);
+  const ensureConnection = () => {
+    if (connection && child && !child.killed) {
+      return connection;
+    }
+
+    child = spawn(process.execPath, [serverEntry, '--stdio'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }) as ChildProcessWithoutNullStreams;
+
+    connection = new JsonRpcConnection(child.stdout, child.stdin, {
+      label: 'typescript-language-server',
+      requestTimeout: DEFAULT_REQUEST_TIMEOUT,
+    });
+
+    connection.on('notification', (message) => {
+      if (!registrationContext || !message.method) {
+        return;
       }
-      return;
-    }
 
-    if (message.method === 'textDocument/publishDiagnostics' && registrationContext) {
-      const params = message.params ?? {};
-      const diagnostics = Array.isArray(params.diagnostics) ? params.diagnostics : [];
-      registrationContext.publishDiagnostics(params.uri, diagnostics);
-      return;
-    }
+      if (message.method === 'textDocument/publishDiagnostics') {
+        const params = (message.params ?? {}) as { uri?: string; diagnostics?: unknown };
+        const diagnostics = Array.isArray((params as any).diagnostics) ? (params as any).diagnostics : [];
+        if (typeof params.uri === 'string') {
+          registrationContext.publishDiagnostics(params.uri, diagnostics);
+        }
+        return;
+      }
 
-    if (message.method && registrationContext) {
       registrationContext.notifyClient(message.method, message.params ?? {});
-    }
-  };
-
-  const startServer = () => {
-    serverProcess = spawn(process.execPath, [serverEntry, '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
-    buffer = '';
-
-    serverProcess.stdout?.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString();
-      while (true) {
-        const headerEnd = buffer.indexOf('\r\n\r\n');
-        if (headerEnd === -1) break;
-
-        const header = buffer.slice(0, headerEnd);
-        const lengthMatch = header.match(/Content-Length: (\d+)/i);
-        if (!lengthMatch) {
-          buffer = buffer.slice(headerEnd + 4);
-          continue;
-        }
-
-        const contentLength = parseInt(lengthMatch[1], 10);
-        const totalLength = headerEnd + 4 + contentLength;
-        if (buffer.length < totalLength) {
-          break;
-        }
-
-        const payload = buffer.slice(headerEnd + 4, totalLength);
-        buffer = buffer.slice(totalLength);
-
-        try {
-          const message = JSON.parse(payload);
-          handleMessage(message);
-        } catch (error) {
-          console.error('Failed to parse LSP message from typescript-language-server:', error);
-        }
-      }
     });
 
-    serverProcess.stderr?.on('data', (chunk: Buffer) => {
-      console.error('[typescript-language-server]', chunk.toString());
+    connection.on('error', (error) => {
+      console.error('[typescript-language-server] connection error:', error);
     });
 
-    serverProcess.on('error', (error) => {
+    connection.on('close', () => {
+      initialized = false;
+      initializing = null;
+      connection?.removeAllListeners();
+      connection = null;
+      child = null;
+    });
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      console.error('[typescript-language-server]', chunk.toString('utf8'));
+    });
+
+    child.on('error', (error) => {
       console.error('Failed to start typescript-language-server process:', error);
     });
 
-    serverProcess.on('close', () => {
-      serverProcess = null;
-      for (const [, pending] of pendingRequests) {
-        clearTimeout(pending.timeout);
-        pending.reject(new Error('typescript-language-server exited'));
-      }
-      pendingRequests.clear();
+    child.on('exit', () => {
+      connection?.dispose();
+      connection = null;
+      child = null;
       initialized = false;
-      initPromise = null;
-      initializationResult = null;
+      initializing = null;
     });
-  };
 
-  const ensureServer = () => {
-    if (!serverProcess) {
-      startServer();
-    }
-  };
-
-  const writeMessage = (payload: string) => {
-    if (!serverProcess || !serverProcess.stdin || serverProcess.stdin.destroyed) {
-      throw new Error('typescript-language-server process is not available.');
-    }
-    serverProcess.stdin.write(payload);
-  };
-
-  const stopServer = async () => {
-    if (!serverProcess) {
-      return;
-    }
-    const proc = serverProcess;
-    await new Promise<void>((resolve) => {
-      (proc as any).once('close', resolve);
-      try {
-        proc.kill('SIGTERM');
-      } catch {
-        resolve();
-      }
-    });
-  };
-
-  const sendRawRequest = (method: string, params: unknown): Promise<unknown> => {
-    ensureServer();
-    const id = ++requestId;
-    const message = JSON.stringify({ jsonrpc: '2.0', id, method, params });
-    const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
-
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        if (pendingRequests.has(id)) {
-          pendingRequests.delete(id);
-          reject(new Error(`typescript-language-server request "${method}" timed out.`));
-        }
-      }, 15000);
-
-      pendingRequests.set(id, { resolve, reject, timeout });
-      try {
-        writeMessage(content);
-      } catch (error) {
-        pendingRequests.delete(id);
-        clearTimeout(timeout);
-        reject(error);
-        return;
-      }
-    });
+    return connection;
   };
 
   const flushPendingNotifications = () => {
-    if (!initialized || !serverProcess || !serverProcess.stdin || serverProcess.stdin.destroyed) {
+    if (!initialized || !connection) {
       return;
     }
     while (pendingNotifications.length > 0) {
-      const { method, params } = pendingNotifications.shift()!;
-      const message = JSON.stringify({ jsonrpc: '2.0', method, params });
-      const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
-      writeMessage(content);
-    }
-  };
-
-  const sendNotification = (method: string, params: unknown) => {
-    if (!initialized) {
-      pendingNotifications.push({ method, params });
-      ensureServer();
-      if (!initPromise) {
-        ensureInitialized();
+      const next = pendingNotifications.shift()!;
+      try {
+        connection.sendNotification(next.method, next.params);
+      } catch (error) {
+        console.error('Failed to send buffered notification to typescript-language-server:', error);
       }
-      return;
-    }
-
-    const message = JSON.stringify({ jsonrpc: '2.0', method, params });
-    const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
-    try {
-      writeMessage(content);
-    } catch (error) {
-      console.error('Failed to send notification to typescript-language-server:', error);
     }
   };
 
-  const ensureInitialized = (ctx?: LanguageRegistrationContext | null): Promise<unknown> => {
-    if (initialized) {
-      return Promise.resolve(initializationResult);
+  const ensureInitialized = (ctx?: LanguageRegistrationContext | null): Promise<InitializationState> => {
+    if (initialized && lastInitialization) {
+      return Promise.resolve(lastInitialization);
     }
 
-    if (!initPromise) {
-      initPromise = (async () => {
+    if (!initializing) {
+      initializing = (async () => {
         const context = ctx ?? registrationContext;
-        ensureServer();
+        const conn = ensureConnection();
         const workspaceFolder = context?.options.workspaceFolders?.[0];
-        const rootUri = workspaceFolder ? `file://${workspaceFolder}` : null;
-        const result = await sendRawRequest('initialize', {
+        const rootUri = workspaceFolder ? pathToFileURL(workspaceFolder).toString() : null;
+        const result = await conn.sendRequest('initialize', {
           processId: process.pid ?? null,
           rootUri,
           capabilities: {
@@ -235,64 +151,116 @@ export function createTypeScriptAdapter(): LanguageAdapter {
           workspaceFolders: workspaceFolder ? [{ uri: rootUri, name: 'workspace' }] : [],
         });
 
-        const message = JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} });
-        const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
-        writeMessage(content);
-
+        conn.sendNotification('initialized', {});
         initialized = true;
-        initializationResult = result;
+        lastInitialization = { result, timestamp: Date.now() };
         flushPendingNotifications();
-        return result;
-      })().catch((error) => {
-        initPromise = null;
-        throw error;
-      });
+        return lastInitialization;
+      })()
+        .catch((error) => {
+          initialized = false;
+          lastInitialization = null;
+          if (connection) {
+            connection.dispose();
+            connection = null;
+          }
+          if (child && !child.killed) {
+            try {
+              child.kill('SIGTERM');
+            } catch {
+              // ignore
+            }
+          }
+          throw error;
+        })
+        .finally(() => {
+          initializing = null;
+        });
     }
 
-    return initPromise;
+    return initializing;
   };
 
-  const sendRequest = async (method: string, params: unknown): Promise<unknown> => {
+  const sendNotification = (method: string, params: unknown) => {
+    try {
+      const conn = ensureConnection();
+      if (!initialized) {
+        pendingNotifications.push({ method, params });
+        ensureInitialized().catch(() => undefined);
+        return;
+      }
+      conn.sendNotification(method, params);
+    } catch (error) {
+      console.error(`Failed to send notification "${method}" to typescript-language-server:`, error);
+    }
+  };
+
+  const sendRequest = async (method: string, params: unknown) => {
     await ensureInitialized();
-    return sendRawRequest(method, params);
+    const conn = ensureConnection();
+    return conn.sendRequest(method, params);
   };
 
-  const handlers = {
-    shutdown: async () => {
-      if (!serverProcess) return;
-      if (initialized) {
-        try {
-          let timeoutHandle: ReturnType<typeof setTimeout>;
-          await Promise.race([
-            sendRequest('shutdown', {}).finally(() => {
-              if (timeoutHandle) {
-                clearTimeout(timeoutHandle);
-              }
-            }),
-            new Promise<void>((resolve) => {
-              timeoutHandle = setTimeout(resolve, 2000);
-            }),
-          ]);
-          sendNotification('exit', {});
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (!/typescript-language-server (?:exited|shutdown)/i.test(message)) {
-            console.error('Error shutting down typescript-language-server:', error);
-          }
-        }
-      }
+  const disposeProcess = async () => {
+    const current = child;
+    const conn = connection;
+    connection = null;
+    child = null;
+    initialized = false;
+    initializing = null;
+    lastInitialization = null;
 
-      for (const [, pending] of pendingRequests) {
-        clearTimeout(pending.timeout);
-        pending.reject(new Error('typescript-language-server shutdown'));
-      }
-      pendingRequests.clear();
+    try {
+      conn?.dispose();
+    } catch {
+      // ignore
+    }
 
-      await stopServer();
-      initialized = false;
-      registrationContext = null;
+    if (!current) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const handleClose = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      current.on('close', handleClose);
+      try {
+        current.kill('SIGTERM');
+      } catch {
+        handleClose();
+      }
+    });
+  };
+
+  const handlers: LanguageHandlers = {
+    initialize: async (ctx: LanguageRegistrationContext) => {
+      registrationContext = ctx;
+      const { result } = await ensureInitialized(ctx);
+      return result;
     },
-
+    shutdown: async () => {
+      if (!connection) {
+        return;
+      }
+      try {
+        await Promise.race([
+          connection.sendRequest('shutdown', {}),
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+        connection.sendNotification('exit', {});
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/connection disposed/i.test(message) && !/timed out/i.test(message)) {
+          console.error('Error shutting down typescript-language-server:', error);
+        }
+      } finally {
+        await disposeProcess();
+      }
+    },
     openDocument: (params: { uri: string; languageId: string; text: string; version: number }) => {
       ensureInitialized().catch(() => undefined);
       sendNotification('textDocument/didOpen', {
@@ -304,7 +272,6 @@ export function createTypeScriptAdapter(): LanguageAdapter {
         },
       });
     },
-
     updateDocument: (params: {
       uri: string;
       languageId: string;
@@ -314,29 +281,22 @@ export function createTypeScriptAdapter(): LanguageAdapter {
     }) => {
       ensureInitialized().catch(() => undefined);
       const contentChanges = Array.isArray(params.changes) && params.changes.length > 0
-        ? params.changes.map((change) => {
-            if (change.range) {
-              return { range: change.range, text: change.text };
-            }
-            return { text: change.text };
-          })
+        ? params.changes.map((change) => ({
+            range: change.range,
+            text: change.text,
+          }))
         : [{ text: params.text }];
       sendNotification('textDocument/didChange', {
-        textDocument: {
-          uri: params.uri,
-          version: params.version,
-        },
+        textDocument: { uri: params.uri, version: params.version },
         contentChanges,
       });
     },
-
     closeDocument: (params: { uri: string }) => {
       ensureInitialized().catch(() => undefined);
       sendNotification('textDocument/didClose', {
         textDocument: { uri: params.uri },
       });
     },
-
     getCompletions: (params: unknown) => sendRequest('textDocument/completion', params),
     getHover: (params: unknown) => sendRequest('textDocument/hover', params),
     getDefinition: (params: unknown) => sendRequest('textDocument/definition', params),
@@ -344,26 +304,22 @@ export function createTypeScriptAdapter(): LanguageAdapter {
     getDocumentSymbols: (params: unknown) => sendRequest('textDocument/documentSymbol', params),
     renameSymbol: (params: unknown) => sendRequest('textDocument/rename', params),
     formatDocument: (params: unknown) => sendRequest('textDocument/formatting', params),
+    formatRange: (params: unknown) => sendRequest('textDocument/rangeFormatting', params),
+    sendRequest,
+    sendNotification: (method: string, params: unknown) => {
+      ensureInitialized().catch(() => undefined);
+      sendNotification(method, params);
+    },
   };
 
   return {
     languageId: 'typescript',
-    initialize: async (ctx: LanguageRegistrationContext) => {
-      registrationContext = ctx;
-      return ensureInitialized(ctx);
-    },
+    initialize: (ctx: LanguageRegistrationContext) => handlers.initialize!(ctx),
     handlers,
     dispose: async () => {
-      await stopServer();
-      for (const [, pending] of pendingRequests) {
-        clearTimeout(pending.timeout);
-      }
-      pendingRequests.clear();
-      registrationContext = null;
-      initializationResult = null;
-      initPromise = null;
       pendingNotifications.length = 0;
-      buffer = '';
+      registrationContext = null;
+      await disposeProcess();
     },
   };
 }

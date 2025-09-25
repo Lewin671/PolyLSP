@@ -1,249 +1,303 @@
-import { ChildProcess, spawn } from 'child_process';
-import { TextDecoder } from 'util';
-import { DocumentChange, LanguageAdapter, LanguageRegistrationContext } from '../types';
+import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { pathToFileURL } from 'url';
+import {
+  DocumentChange,
+  LanguageAdapter,
+  LanguageHandlers,
+  LanguageRegistrationContext,
+} from '../types';
+import { JsonRpcConnection } from '../utils/jsonRpc';
+
+const DEFAULT_REQUEST_TIMEOUT = 10000;
+
+type PendingNotification = { method: string; params: unknown };
+
+type InitializationState = { result: unknown };
 
 export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageAdapter {
-    const goplsPath = options.goplsPath || 'gopls';
+  const goplsPath = options.goplsPath || 'gopls';
 
-    let process: ChildProcess | null = null;
-    let requestId = 0;
-    const pendingRequests = new Map<number, (result: any) => void>();
-    let initialized = false;
-    let registrationContext: LanguageRegistrationContext | null = null;
-    const decoder = new TextDecoder('utf-8');
-    let buffer = new Uint8Array(0);
+  let processRef: ChildProcessWithoutNullStreams | null = null;
+  let connection: JsonRpcConnection | null = null;
+  let registrationContext: LanguageRegistrationContext | null = null;
+  let initializing: Promise<InitializationState> | null = null;
+  let initialized = false;
+  let lastResult: InitializationState | null = null;
+  const pendingNotifications: PendingNotification[] = [];
 
-    const startServer = () => {
-        process = spawn(goplsPath, ['-mode=stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const ensureConnection = () => {
+    if (connection && processRef && !processRef.killed) {
+      return connection;
+    }
 
-        let headerMode = true;
-        let contentLength = 0;
-        process.stdout!.on('data', (data: Buffer) => {
-            const incoming = new Uint8Array(data);
-            const combined = new Uint8Array(buffer.length + incoming.length);
-            combined.set(buffer);
-            combined.set(incoming, buffer.length);
-            buffer = combined;
+    processRef = spawn(goplsPath, ['-mode=stdio'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }) as ChildProcessWithoutNullStreams;
 
-            while (buffer.length > 0) {
-                if (headerMode) {
-                    let headerEnd = -1;
-                    for (let i = 0; i <= buffer.length - 4; i++) {
-                        if (buffer[i] === 13 && buffer[i + 1] === 10 && buffer[i + 2] === 13 && buffer[i + 3] === 10) {
-                            headerEnd = i;
-                            break;
-                        }
-                    }
-                    if (headerEnd === -1) break;
+    connection = new JsonRpcConnection(processRef.stdout, processRef.stdin, {
+      label: 'gopls',
+      requestTimeout: DEFAULT_REQUEST_TIMEOUT,
+    });
 
-                    const headerBuffer = buffer.slice(0, headerEnd);
-                    buffer = buffer.slice(headerEnd + 4);
+    connection.on('notification', (message) => {
+      if (!message.method || !registrationContext) {
+        return;
+      }
 
-                    const headers = decoder.decode(headerBuffer);
-                    const lengthMatch = headers.match(/Content-Length: (\d+)/i);
-                    if (lengthMatch) {
-                        contentLength = parseInt(lengthMatch[1], 10);
-                        headerMode = false;
-                    }
-                } else {
-                    if (buffer.length < contentLength) {
-                        break;
-                    }
+      if (message.method === 'textDocument/publishDiagnostics') {
+        const params = (message.params ?? {}) as { uri?: string; diagnostics?: unknown };
+        const diagnostics = Array.isArray((params as any).diagnostics) ? (params as any).diagnostics : [];
+        if (typeof params.uri === 'string') {
+          registrationContext.publishDiagnostics(params.uri, diagnostics);
+        }
+        return;
+      }
 
-                    const messageBuffer = buffer.slice(0, contentLength);
-                    buffer = buffer.slice(contentLength);
-                    headerMode = true;
-                    contentLength = 0;
+      registrationContext.notifyClient(message.method, message.params ?? {});
+    });
 
-                    try {
-                        const messageContent = decoder.decode(messageBuffer);
-                        const msg = JSON.parse(messageContent);
-                        if (msg.id !== undefined && pendingRequests.has(msg.id)) {
-                            const resolve = pendingRequests.get(msg.id)!;
-                            pendingRequests.delete(msg.id);
-                            if (msg.result !== undefined) {
-                                resolve(msg.result);
-                            } else if (msg.error) {
-                                console.error('LSP Error:', msg.error);
-                                resolve(null);
-                            } else {
-                                resolve(msg);
-                            }
-                        } else if (msg.method) {
-                            if (msg.method === 'textDocument/publishDiagnostics' && registrationContext) {
-                                const params = msg.params ?? {};
-                                const diagnostics = Array.isArray(params.diagnostics) ? params.diagnostics : [];
-                                registrationContext.publishDiagnostics(params.uri, diagnostics);
-                            } else if (registrationContext) {
-                                registrationContext.notifyClient(msg.method, msg.params ?? {});
-                            }
-                        }
-                    } catch (e) {
-                        console.error('Failed to parse LSP message:', e);
-                    }
-                }
-            }
+    connection.on('error', (error) => {
+      console.error('[gopls] connection error:', error);
+    });
+
+    connection.on('close', () => {
+      initialized = false;
+      initializing = null;
+      connection?.removeAllListeners();
+      connection = null;
+      processRef = null;
+    });
+
+    processRef.stderr?.on('data', (chunk: Buffer) => {
+      console.error('[gopls]', chunk.toString('utf8'));
+    });
+
+    processRef.on('error', (error) => {
+      console.error('Failed to start gopls process:', error);
+    });
+
+    processRef.on('exit', () => {
+      connection?.dispose();
+      connection = null;
+      initialized = false;
+      initializing = null;
+      processRef = null;
+    });
+
+    return connection;
+  };
+
+  const flushPendingNotifications = () => {
+    if (!initialized || !connection) {
+      return;
+    }
+    while (pendingNotifications.length > 0) {
+      const { method, params } = pendingNotifications.shift()!;
+      try {
+        connection.sendNotification(method, params);
+      } catch (error) {
+        console.error('Failed to send buffered notification to gopls:', error);
+      }
+    }
+  };
+
+  const ensureInitialized = (ctx?: LanguageRegistrationContext | null): Promise<InitializationState> => {
+    if (initialized && lastResult) {
+      return Promise.resolve(lastResult);
+    }
+
+    if (!initializing) {
+      initializing = (async () => {
+        const context = ctx ?? registrationContext;
+        const conn = ensureConnection();
+        const workspaceFolder = context?.options.workspaceFolders?.[0];
+        const rootUri = workspaceFolder ? pathToFileURL(workspaceFolder).toString() : null;
+        const result = await conn.sendRequest('initialize', {
+          processId: processRef?.pid || null,
+          rootUri,
+          capabilities: {
+            textDocument: {
+              synchronization: { dynamicRegistration: false },
+              completion: { dynamicRegistration: false },
+              hover: { dynamicRegistration: false },
+              definition: { dynamicRegistration: false },
+              references: { dynamicRegistration: false },
+              documentSymbol: { dynamicRegistration: false },
+              formatting: { dynamicRegistration: false },
+              rename: { dynamicRegistration: false },
+            },
+            workspace: { workspaceFolders: true },
+          },
+          workspaceFolders: workspaceFolder ? [{ uri: rootUri, name: 'workspace' }] : [],
         });
 
-        process.on('close', (code: number | null) => {
-            console.log(`gopls exited with code ${code}`);
-            process = null;
+        conn.sendNotification('initialized', {});
+        initialized = true;
+        lastResult = { result };
+        flushPendingNotifications();
+        return lastResult;
+      })()
+        .catch((error) => {
+          initialized = false;
+          lastResult = null;
+          if (connection) {
+            connection.dispose();
+            connection = null;
+          }
+          if (processRef && !processRef.killed) {
+            try {
+              processRef.kill('SIGTERM');
+            } catch {
+              // ignore
+            }
+          }
+          throw error;
+        })
+        .finally(() => {
+          initializing = null;
         });
+    }
 
-        process.on('error', (error) => {
-            console.error('gopls error:', error);
-        });
-    };
+    return initializing;
+  };
 
-    const sendRequest = async (method: string, params: any): Promise<any> => {
-        if (!process) startServer();
-        const id = ++requestId;
-        const message = JSON.stringify({ jsonrpc: '2.0', id, method, params });
-        const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
+  const sendNotification = (method: string, params: unknown) => {
+    try {
+      const conn = ensureConnection();
+      if (!initialized) {
+        pendingNotifications.push({ method, params });
+        ensureInitialized().catch(() => undefined);
+        return;
+      }
+      conn.sendNotification(method, params);
+    } catch (error) {
+      console.error(`Failed to send notification "${method}" to gopls:`, error);
+    }
+  };
 
-        return new Promise((resolve) => {
-            pendingRequests.set(id, resolve);
-            if (process && process.stdin && !process.stdin.destroyed) {
-                process.stdin.write(content);
-            } else {
-                resolve(null);
-                return;
-            }
+  const sendRequest = async (method: string, params: unknown) => {
+    await ensureInitialized();
+    const conn = ensureConnection();
+    return conn.sendRequest(method, params, { timeout: DEFAULT_REQUEST_TIMEOUT });
+  };
 
-            // Timeout after 5 seconds for faster test completion
-            setTimeout(() => {
-                if (pendingRequests.has(id)) {
-                    pendingRequests.delete(id);
-                    resolve(null);
-                }
-            }, 5000);
-        });
-    };
+  const shutdownProcess = async () => {
+    const current = processRef;
+    const conn = connection;
+    processRef = null;
+    connection = null;
+    initializing = null;
+    initialized = false;
+    lastResult = null;
 
-    const sendNotification = (method: string, params: any) => {
-        if (!process) return;
-        const message = JSON.stringify({ jsonrpc: '2.0', method, params });
-        const content = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
-        process.stdin!.write(content);
-    };
+    try {
+      conn?.dispose();
+    } catch {
+      // ignore
+    }
 
-    const handlers = {
-        initialize: async (ctx: LanguageRegistrationContext) => {
-            registrationContext = ctx;
-            const workspaceFolder = ctx.options.workspaceFolders?.[0];
-            const rootUri = workspaceFolder ? `file://${workspaceFolder}` : null;
+    if (!current) {
+      return;
+    }
 
-            const result = await sendRequest('initialize', {
-                processId: process?.pid || null,
-                rootUri,
-                capabilities: {
-                    textDocument: {
-                        synchronization: { dynamicRegistration: false },
-                        completion: { dynamicRegistration: false },
-                        hover: { dynamicRegistration: false },
-                        definition: { dynamicRegistration: false },
-                        references: { dynamicRegistration: false },
-                        documentSymbol: { dynamicRegistration: false },
-                        formatting: { dynamicRegistration: false },
-                        rename: { dynamicRegistration: false }
-                    },
-                    workspace: {
-                        workspaceFolders: true
-                    }
-                },
-                workspaceFolders: workspaceFolder ? [{ uri: rootUri, name: 'workspace' }] : []
-            });
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const handleClose = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      current.on('close', handleClose);
+      try {
+        current.kill('SIGTERM');
+      } catch {
+        handleClose();
+      }
+    });
+  };
 
-            sendNotification('initialized', {});
-            initialized = true;
-            return result;
+  const handlers: LanguageHandlers = {
+    initialize: async (ctx: LanguageRegistrationContext) => {
+      registrationContext = ctx;
+      const { result } = await ensureInitialized(ctx);
+      return result;
+    },
+    shutdown: async () => {
+      if (!connection) {
+        await shutdownProcess();
+        return;
+      }
+      try {
+        await Promise.race([
+          connection.sendRequest('shutdown', {}),
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+        connection.sendNotification('exit', {});
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/connection disposed/i.test(message) && !/timed out/i.test(message)) {
+          console.error('Error shutting down gopls:', error);
+        }
+      } finally {
+        await shutdownProcess();
+      }
+    },
+    openDocument: (params: { uri: string; languageId: string; text: string; version: number }) => {
+      ensureInitialized().catch(() => undefined);
+      sendNotification('textDocument/didOpen', {
+        textDocument: {
+          uri: params.uri,
+          languageId: params.languageId,
+          version: params.version,
+          text: params.text,
         },
+      });
+    },
+    updateDocument: (params: {
+      uri: string;
+      languageId: string;
+      version: number;
+      text: string;
+      changes: DocumentChange[];
+    }) => {
+      ensureInitialized().catch(() => undefined);
+      const contentChanges = Array.isArray(params.changes) && params.changes.length > 0
+        ? params.changes.map((change) => ({ range: change.range, text: change.text }))
+        : [{ text: params.text }];
+      sendNotification('textDocument/didChange', {
+        textDocument: { uri: params.uri, version: params.version },
+        contentChanges,
+      });
+    },
+    closeDocument: (params: { uri: string }) => {
+      ensureInitialized().catch(() => undefined);
+      sendNotification('textDocument/didClose', {
+        textDocument: { uri: params.uri },
+      });
+    },
+    getCompletions: (params: unknown) => sendRequest('textDocument/completion', params),
+    getHover: (params: unknown) => sendRequest('textDocument/hover', params),
+    getDefinition: (params: unknown) => sendRequest('textDocument/definition', params),
+    findReferences: (params: unknown) => sendRequest('textDocument/references', params),
+    getDocumentSymbols: (params: unknown) => sendRequest('textDocument/documentSymbol', params),
+    renameSymbol: (params: unknown) => sendRequest('textDocument/rename', params),
+    formatDocument: (params: unknown) => sendRequest('textDocument/formatting', params),
+    formatRange: (params: unknown) => sendRequest('textDocument/rangeFormatting', params),
+    sendRequest,
+    sendNotification: (method: string, params: unknown) => {
+      ensureInitialized().catch(() => undefined);
+      sendNotification(method, params);
+    },
+  };
 
-        openDocument: (params: { uri: string; languageId: string; text: string; version: number }) => {
-            sendNotification('textDocument/didOpen', {
-                textDocument: {
-                    uri: params.uri,
-                    languageId: params.languageId,
-                    version: params.version,
-                    text: params.text
-                }
-            });
-        },
-
-        updateDocument: (params: {
-            uri: string;
-            languageId: string;
-            version: number;
-            text: string;
-            changes: DocumentChange[];
-        }) => {
-            const contentChanges = Array.isArray(params.changes) && params.changes.length > 0
-                ? params.changes.map((change) => {
-                    if (change.range) {
-                        return { range: change.range, text: change.text };
-                    }
-                    return { text: change.text };
-                })
-                : [{ text: params.text }];
-            sendNotification('textDocument/didChange', {
-                textDocument: {
-                    uri: params.uri,
-                    version: params.version,
-                },
-                contentChanges,
-            });
-        },
-
-        closeDocument: (params: { uri: string }) => {
-            sendNotification('textDocument/didClose', {
-                textDocument: { uri: params.uri }
-            });
-        },
-
-        shutdown: async () => {
-            if (initialized) {
-                try {
-                    await Promise.race([
-                        sendRequest('shutdown', {}),
-                        new Promise(resolve => setTimeout(resolve, 2000)) // 2s timeout
-                    ]);
-                    sendNotification('exit', {});
-                } catch (error) {
-                    console.error('Error during gopls shutdown:', error);
-                }
-                initialized = false;
-            }
-
-            // Clear all pending requests
-            for (const [id, resolve] of pendingRequests) {
-                resolve(null);
-            }
-            pendingRequests.clear();
-
-            if (process) {
-                process.kill('SIGTERM');
-                // Force kill after 1 second if still running
-                setTimeout(() => {
-                    if (process && !process.killed) {
-                        process.kill('SIGKILL');
-                        process = null;
-                    }
-                }, 1000);
-            }
-            registrationContext = null;
-        },
-
-        getCompletions: (params: any) => sendRequest('textDocument/completion', params),
-        getHover: (params: any) => sendRequest('textDocument/hover', params),
-        getDefinition: (params: any) => sendRequest('textDocument/definition', params),
-        findReferences: (params: any) => sendRequest('textDocument/references', params),
-        getDocumentSymbols: (params: any) => sendRequest('textDocument/documentSymbol', params),
-        renameSymbol: (params: any) => sendRequest('textDocument/rename', params),
-        formatDocument: (params: any) => sendRequest('textDocument/formatting', params),
-    };
-
-    return {
-        languageId: 'go',
-        handlers,
-    };
+  return {
+    languageId: 'go',
+    initialize: (ctx: LanguageRegistrationContext) => handlers.initialize!(ctx),
+    handlers,
+    dispose: async () => {
+      pendingNotifications.length = 0;
+      registrationContext = null;
+      await shutdownProcess();
+    },
+  };
 }
