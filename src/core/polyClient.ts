@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'url';
 import { CLIENT_BRAND } from '../constants';
 import { PolyClientError } from '../errors';
 import {
@@ -625,7 +626,10 @@ export class PolyClient implements PolyClientApi {
       case 'workspace/didChangeWorkspaceFolders':
         return null;
       case 'workspace/workspaceFolders': {
-        return this.workspaceFolders.map((folder) => ({ uri: folder, name: folder.split(/[\\/]/).pop() ?? folder }));
+        return this.workspaceFolders.map((folder) => ({ 
+          uri: pathToFileURL(folder).toString(), 
+          name: folder.split(/[\\/]/).pop() ?? folder 
+        }));
       }
       default: {
         const listeners = this.notificationListeners.get(method);
