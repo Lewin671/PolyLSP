@@ -18,8 +18,74 @@ export type DocumentChange = {
   range?: Range;
 };
 
+export type TextDocumentSyncKind = 0 | 1 | 2;
+
+export type SaveOptions = {
+  includeText?: boolean;
+};
+
+export type TextDocumentSyncOptions = {
+  openClose?: boolean;
+  change?: TextDocumentSyncKind;
+  willSave?: boolean;
+  willSaveWaitUntil?: boolean;
+  save?: boolean | SaveOptions;
+};
+
+export type ChangeAnnotation = {
+  label: string;
+  needsConfirmation?: boolean;
+  description?: string;
+};
+
+export type AnnotatedTextEdit = TextEdit & {
+  annotationId?: string;
+};
+
+export type OptionalVersionedTextDocumentIdentifier = {
+  uri: string;
+  version?: number | null;
+};
+
+export type TextDocumentEdit = {
+  textDocument: OptionalVersionedTextDocumentIdentifier;
+  edits: (TextEdit | AnnotatedTextEdit)[];
+};
+
+export type CreateFile = {
+  kind: 'create';
+  uri: string;
+  options?: {
+    overwrite?: boolean;
+    ignoreIfExists?: boolean;
+  };
+};
+
+export type RenameFile = {
+  kind: 'rename';
+  oldUri: string;
+  newUri: string;
+  options?: {
+    overwrite?: boolean;
+    ignoreIfExists?: boolean;
+  };
+};
+
+export type DeleteFile = {
+  kind: 'delete';
+  uri: string;
+  options?: {
+    recursive?: boolean;
+    ignoreIfNotExists?: boolean;
+  };
+};
+
+export type WorkspaceDocumentChange = TextDocumentEdit | CreateFile | RenameFile | DeleteFile;
+
 export type WorkspaceEdit = {
   changes?: Record<string, TextEdit[]>;
+  documentChanges?: WorkspaceDocumentChange[];
+  changeAnnotations?: Record<string, ChangeAnnotation>;
 };
 
 export type Diagnostic = {
@@ -81,6 +147,15 @@ export type RequestContext = {
 
 export type NotifyClient = (method: string, payload: unknown) => void;
 
+export type HandleServerRequest = (method: string, params: unknown) => MaybePromise<unknown>;
+
+export type ApplyWorkspaceEditResult = {
+  applied: boolean;
+  failures: { uri: string; reason: string }[];
+  failureReason?: string;
+  failedChange?: number;
+};
+
 export type LanguageRegistrationContext = {
   languageId: string;
   options: PolyClientOptions;
@@ -90,6 +165,8 @@ export type LanguageRegistrationContext = {
   listDocuments(): TextDocument[];
   getRegisteredLanguages(): string[];
   notifyClient: NotifyClient;
+  handleServerRequest: HandleServerRequest;
+  applyWorkspaceEdit(edit: WorkspaceEdit): ApplyWorkspaceEditResult;
   registerDisposable(dispose: () => void | Promise<void>): void;
 };
 
@@ -165,6 +242,6 @@ export interface PolyClient {
   onDiagnostics(uri: string, listener: Listener<DiagnosticsEvent>): Disposable;
   onWorkspaceEvent(kind: string, listener: Listener<WorkspaceEvent>): Disposable;
   onError(listener: Listener<AdapterErrorEvent>): Disposable;
-  applyWorkspaceEdit(edit: WorkspaceEdit): { applied: boolean; failures: { uri: string; reason: string }[] };
+  applyWorkspaceEdit(edit: WorkspaceEdit): ApplyWorkspaceEditResult;
   dispose(): MaybePromise<void>;
 }

@@ -9,6 +9,12 @@ export type JsonRpcMessage = {
   error?: unknown;
 };
 
+export type JsonRpcErrorPayload = {
+  code: number;
+  message: string;
+  data?: unknown;
+};
+
 export type JsonRpcConnectionOptions = {
   requestTimeout?: number;
   encoding?: BufferEncoding;
@@ -165,8 +171,14 @@ export class JsonRpcConnection extends EventEmitter {
           if (pending.timer) {
             clearTimeout(pending.timer);
           }
-          pending.resolve(message.error ?? message.result ?? null);
+          if (message.error !== undefined && message.error !== null) {
+            pending.reject(this.normalizeResponseError(message.error));
+          } else {
+            pending.resolve(message.result ?? null);
+          }
           this.emit('response', message);
+        } else if (message.method && message.id !== undefined && message.id !== null) {
+          this.emit('request', message);
         } else if (message.method) {
           this.emit('notification', message);
         }
@@ -207,5 +219,63 @@ export class JsonRpcConnection extends EventEmitter {
   private writeFrame(payload: string): void {
     const content = `Content-Length: ${Buffer.byteLength(payload, this.encoding)}\r\n\r\n${payload}`;
     this.writable.write(content, this.encoding);
+  }
+
+  sendResponse(id: number | string, result: unknown): void {
+    if (this.closed) {
+      throw new Error(`${this.label} connection is closed`);
+    }
+    const message = JSON.stringify({ jsonrpc: '2.0', id, result: result ?? null });
+    this.writeFrame(message);
+  }
+
+  sendErrorResponse(id: number | string, error: unknown): void {
+    if (this.closed) {
+      throw new Error(`${this.label} connection is closed`);
+    }
+    const payload = this.normalizeErrorPayload(error);
+    const message = JSON.stringify({ jsonrpc: '2.0', id, error: payload });
+    this.writeFrame(message);
+  }
+
+  private normalizeResponseError(error: unknown): Error {
+    if (error instanceof Error) {
+      return error;
+    }
+    if (error && typeof error === 'object') {
+      const { message, code, data } = error as { message?: unknown; code?: unknown; data?: unknown };
+      const err = new Error(typeof message === 'string' ? message : 'JSON-RPC request failed');
+      if (code !== undefined) {
+        (err as Error & { code?: unknown }).code = code;
+      }
+      if (data !== undefined) {
+        (err as Error & { data?: unknown }).data = data;
+      }
+      return err;
+    }
+    return new Error(typeof error === 'string' ? error : 'JSON-RPC request failed');
+  }
+
+  private normalizeErrorPayload(error: unknown): JsonRpcErrorPayload {
+    if (error && typeof error === 'object' && 'code' in (error as Record<string, unknown>) && 'message' in (error as Record<string, unknown>)) {
+      const { code, message, data } = error as { code: unknown; message: unknown; data?: unknown };
+      return {
+        code: typeof code === 'number' ? code : -32603,
+        message: typeof message === 'string' ? message : 'Internal error',
+        data,
+      };
+    }
+    if (error instanceof Error) {
+      return {
+        code: -32603,
+        message: error.message,
+        data: { stack: error.stack },
+      };
+    }
+    return {
+      code: -32603,
+      message: typeof error === 'string' ? error : 'Internal error',
+      data: error,
+    };
   }
 }

@@ -5,6 +5,10 @@ import {
   LanguageAdapter,
   LanguageHandlers,
   LanguageRegistrationContext,
+  SaveOptions,
+  TextDocumentSyncKind,
+  TextDocumentSyncOptions,
+  WorkspaceEdit,
 } from '../types';
 import { JsonRpcConnection } from '../utils/jsonRpc';
 
@@ -13,6 +17,67 @@ const DEFAULT_REQUEST_TIMEOUT = 10000;
 type PendingNotification = { method: string; params: unknown };
 
 type InitializationState = { result: unknown };
+
+type ResolvedTextDocumentSync = {
+  openClose: boolean;
+  change: TextDocumentSyncKind;
+  willSave: boolean;
+  willSaveWaitUntil: boolean;
+  save?: boolean | SaveOptions;
+};
+
+const TEXT_DOCUMENT_SYNC_KIND: Record<'None' | 'Full' | 'Incremental', TextDocumentSyncKind> = {
+  None: 0,
+  Full: 1,
+  Incremental: 2,
+};
+
+const DEFAULT_TEXT_DOCUMENT_SYNC: ResolvedTextDocumentSync = {
+  openClose: true,
+  change: TEXT_DOCUMENT_SYNC_KIND.Incremental,
+  willSave: false,
+  willSaveWaitUntil: false,
+};
+
+function resolveTextDocumentSync(sync: unknown): ResolvedTextDocumentSync {
+  const result: ResolvedTextDocumentSync = { ...DEFAULT_TEXT_DOCUMENT_SYNC };
+  if (typeof sync === 'number') {
+    if (sync === TEXT_DOCUMENT_SYNC_KIND.None) {
+      result.change = TEXT_DOCUMENT_SYNC_KIND.None;
+    } else if (sync === TEXT_DOCUMENT_SYNC_KIND.Full) {
+      result.change = TEXT_DOCUMENT_SYNC_KIND.Full;
+    } else {
+      result.change = TEXT_DOCUMENT_SYNC_KIND.Incremental;
+    }
+    return result;
+  }
+  if (!sync || typeof sync !== 'object') {
+    return result;
+  }
+  const options = sync as TextDocumentSyncOptions;
+  if (typeof options.openClose === 'boolean') {
+    result.openClose = options.openClose;
+  }
+  if (typeof options.change === 'number') {
+    if (options.change === TEXT_DOCUMENT_SYNC_KIND.None) {
+      result.change = TEXT_DOCUMENT_SYNC_KIND.None;
+    } else if (options.change === TEXT_DOCUMENT_SYNC_KIND.Full) {
+      result.change = TEXT_DOCUMENT_SYNC_KIND.Full;
+    } else {
+      result.change = TEXT_DOCUMENT_SYNC_KIND.Incremental;
+    }
+  }
+  if (typeof options.willSave === 'boolean') {
+    result.willSave = options.willSave;
+  }
+  if (typeof options.willSaveWaitUntil === 'boolean') {
+    result.willSaveWaitUntil = options.willSaveWaitUntil;
+  }
+  if (typeof options.save === 'boolean' || (options.save && typeof options.save === 'object')) {
+    result.save = options.save;
+  }
+  return result;
+}
 
 export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageAdapter {
   const goplsPath = options.goplsPath || 'gopls';
@@ -24,6 +89,7 @@ export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageA
   let initialized = false;
   let lastResult: InitializationState | null = null;
   const pendingNotifications: PendingNotification[] = [];
+  let textDocumentSync: ResolvedTextDocumentSync = { ...DEFAULT_TEXT_DOCUMENT_SYNC };
 
   const ensureConnection = () => {
     if (connection && processRef && !processRef.killed) {
@@ -54,6 +120,39 @@ export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageA
       }
 
       registrationContext.notifyClient(message.method, message.params ?? {});
+    });
+
+    connection.on('request', async (message) => {
+      const activeConnection = connection;
+      if (!registrationContext || !activeConnection || !message.method || message.id === undefined || message.id === null) {
+        return;
+      }
+      try {
+        if (message.method === 'workspace/applyEdit') {
+          const params = (message.params ?? {}) as { edit?: WorkspaceEdit };
+          if (!params || typeof params !== 'object' || typeof params.edit !== 'object') {
+            activeConnection.sendErrorResponse(message.id, new Error('Invalid workspace/applyEdit payload'));
+            return;
+          }
+          const result = registrationContext.applyWorkspaceEdit(params.edit as WorkspaceEdit);
+          const response: Record<string, unknown> = { applied: result.applied };
+          if (!result.applied) {
+            response.failureReason = result.failureReason ?? 'Workspace edit failed';
+            if (typeof result.failedChange === 'number') {
+              response.failedChange = result.failedChange;
+            }
+          }
+          activeConnection.sendResponse(message.id, response);
+          return;
+        }
+        const result = await registrationContext.handleServerRequest(
+          message.method,
+          message.params ?? {},
+        );
+        activeConnection.sendResponse(message.id, result ?? null);
+      } catch (error) {
+        activeConnection.sendErrorResponse(message.id, error);
+      }
     });
 
     connection.on('error', (error) => {
@@ -126,16 +225,19 @@ export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageA
               formatting: { dynamicRegistration: false },
               rename: { dynamicRegistration: false },
             },
-            workspace: { workspaceFolders: true },
-          },
-          workspaceFolders: workspaceFolder ? [{ uri: rootUri, name: 'workspace' }] : [],
-        });
+          workspace: { workspaceFolders: true },
+        },
+        workspaceFolders: workspaceFolder ? [{ uri: rootUri, name: 'workspace' }] : [],
+      });
 
-        conn.sendNotification('initialized', {});
-        initialized = true;
-        lastResult = { result };
-        flushPendingNotifications();
-        return lastResult;
+      const capabilities = (result as { capabilities?: { textDocumentSync?: unknown } } | null | undefined)?.capabilities;
+      textDocumentSync = resolveTextDocumentSync(capabilities?.textDocumentSync);
+
+      conn.sendNotification('initialized', {});
+      initialized = true;
+      lastResult = { result };
+      flushPendingNotifications();
+      return lastResult;
       })()
         .catch((error) => {
           initialized = false;
@@ -189,6 +291,7 @@ export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageA
     initializing = null;
     initialized = false;
     lastResult = null;
+    textDocumentSync = { ...DEFAULT_TEXT_DOCUMENT_SYNC };
 
     try {
       conn?.dispose();
@@ -244,14 +347,16 @@ export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageA
     },
     openDocument: (params: { uri: string; languageId: string; text: string; version: number }) => {
       ensureInitialized().catch(() => undefined);
-      sendNotification('textDocument/didOpen', {
-        textDocument: {
-          uri: params.uri,
-          languageId: params.languageId,
-          version: params.version,
-          text: params.text,
-        },
-      });
+      if (textDocumentSync.openClose !== false) {
+        sendNotification('textDocument/didOpen', {
+          textDocument: {
+            uri: params.uri,
+            languageId: params.languageId,
+            version: params.version,
+            text: params.text,
+          },
+        });
+      }
     },
     updateDocument: (params: {
       uri: string;
@@ -261,9 +366,17 @@ export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageA
       changes: DocumentChange[];
     }) => {
       ensureInitialized().catch(() => undefined);
-      const contentChanges = Array.isArray(params.changes) && params.changes.length > 0
-        ? params.changes.map((change) => ({ range: change.range, text: change.text }))
-        : [{ text: params.text }];
+      if (textDocumentSync.change === TEXT_DOCUMENT_SYNC_KIND.None) {
+        return;
+      }
+      let contentChanges;
+      if (textDocumentSync.change === TEXT_DOCUMENT_SYNC_KIND.Full) {
+        contentChanges = [{ text: params.text }];
+      } else if (Array.isArray(params.changes) && params.changes.length > 0) {
+        contentChanges = params.changes.map((change) => ({ range: change.range, text: change.text }));
+      } else {
+        contentChanges = [{ text: params.text }];
+      }
       sendNotification('textDocument/didChange', {
         textDocument: { uri: params.uri, version: params.version },
         contentChanges,
@@ -271,9 +384,11 @@ export function createGoAdapter(options: { goplsPath?: string } = {}): LanguageA
     },
     closeDocument: (params: { uri: string }) => {
       ensureInitialized().catch(() => undefined);
-      sendNotification('textDocument/didClose', {
-        textDocument: { uri: params.uri },
-      });
+      if (textDocumentSync.openClose !== false) {
+        sendNotification('textDocument/didClose', {
+          textDocument: { uri: params.uri },
+        });
+      }
     },
     getCompletions: (params: unknown) => sendRequest('textDocument/completion', params),
     getHover: (params: unknown) => sendRequest('textDocument/hover', params),
